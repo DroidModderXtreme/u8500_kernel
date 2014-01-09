@@ -602,7 +602,7 @@ static int battery_get_property(struct power_supply *psy,
 		break;
 	
 	case POWER_SUPPLY_PROP_LPM_MODE:    /* LPM mode */
-#if defined(CONFIG_MACH_JANICE_CHN) || defined(CONFIG_MACH_CODINA_CHN) || defined(CONFIG_MACH_GAVINI_CHN) || defined(CONFIG_MACH_CODINA_EURO) || defined(CONFIG_MACH_CODINA)
+#if defined(CONFIG_MACH_JANICE_CHN) || defined(CONFIG_MACH_CODINA_CHN) || defined(CONFIG_MACH_GAVINI_CHN) || defined(CONFIG_MACH_CODINA_EURO) || defined(CONFIG_MACH_CODINA) || defined(CONFIG_MACH_JANICE)
 		val->intval = sec_lpm_bootmode;
 #else
 		val->intval = charger_extra_sysfs.batt_lp_charging; /* 0 or 1 */
