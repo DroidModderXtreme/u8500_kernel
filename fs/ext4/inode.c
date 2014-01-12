@@ -3655,8 +3655,8 @@ out:
 	spin_unlock_irqrestore(&ei->i_completed_io_lock, flags);
 
 	/* queue the work to convert unwritten extents to written */
-	queue_work(wq, &io_end->work);
 	iocb->private = NULL;
+	queue_work(wq, &io_end->work);
 }
 
 static void ext4_end_io_buffer_write(struct buffer_head *bh, int uptodate)
