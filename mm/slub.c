@@ -592,15 +592,47 @@ static void init_object(struct kmem_cache *s, void *object, u8 val)
 		memset(p + s->objsize, val, s->inuse - s->objsize);
 }
 
-static u8 *check_bytes(u8 *start, unsigned int value, unsigned int bytes)
+static u8 *check_bytes8(u8 *start, u8 value, unsigned int bytes)
 {
 	while (bytes) {
-		if (*start != (u8)value)
+		if (*start != value)
 			return start;
 		start++;
 		bytes--;
 	}
 	return NULL;
+}
+
+static u8 *check_bytes(u8 *start, u8 value, unsigned int bytes)
+{
+	u64 value64;
+	unsigned int words, prefix;
+
+	if (bytes <= 16)
+		return check_bytes8(start, value, bytes);
+
+	value64 = value | value << 8 | value << 16 | value << 24;
+	value64 = value64 | value64 << 32;
+	prefix = 8 - ((unsigned long)start) % 8;
+
+	if (prefix) {
+		u8 *r = check_bytes8(start, value, prefix);
+		if (r)
+			return r;
+		start += prefix;
+		bytes -= prefix;
+	}
+
+	words = bytes / 8;
+
+	while (words) {
+		if (*(u64 *)start != value64)
+			return check_bytes8(start, value, 8);
+		start += 8;
+		words--;
+	}
+
+	return check_bytes8(start, value, bytes % 8);
 }
 
 static void restore_bytes(struct kmem_cache *s, char *message, u8 data,
@@ -3157,6 +3189,42 @@ size_t ksize(const void *object)
 	return slab_ksize(page->slab);
 }
 EXPORT_SYMBOL(ksize);
+
+#ifdef CONFIG_SLUB_DEBUG
+bool verify_mem_not_deleted(const void *x)
+{
+	struct page *page;
+	void *object = (void *)x;
+	unsigned long flags;
+	bool rv;
+
+	if (unlikely(ZERO_OR_NULL_PTR(x)))
+		return false;
+
+	local_irq_save(flags);
+
+	page = virt_to_head_page(x);
+	if (unlikely(!PageSlab(page))) {
+		/* maybe it was from stack? */
+		rv = true;
+		goto out_unlock;
+	}
+
+	slab_lock(page);
+	if (on_freelist(page->slab, page, object)) {
+		object_err(page->slab, page, object, "Object is on free-list");
+		rv = false;
+	} else {
+		rv = true;
+	}
+	slab_unlock(page);
+
+out_unlock:
+	local_irq_restore(flags);
+	return rv;
+}
+EXPORT_SYMBOL(verify_mem_not_deleted);
+#endif
 
 void kfree(const void *x)
 {
