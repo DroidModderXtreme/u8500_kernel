@@ -384,12 +384,21 @@ config X86_INTEL_CE
 	  This option compiles in support for the CE4100 SOC for settop
 	  boxes and media devices.
 
+config X86_INTEL_MID
+	bool "Intel MID platform support"
+	depends on X86_32
+	depends on X86_EXTENDED_PLATFORM
+	---help---
+	  Select to build a kernel capable of supporting Intel MID platform
+	  systems which do not have the PCI legacy interfaces (Moorestown,
+	  Medfield). If you are building for a PC class system say N here.
+
+if X86_INTEL_MID
+
 config X86_MRST
        bool "Moorestown MID platform"
 	depends on PCI
 	depends on PCI_GOANY
-	depends on X86_32
-	depends on X86_EXTENDED_PLATFORM
 	depends on X86_IO_APIC
 	select APB_TIMER
 	select I2C
@@ -403,6 +412,8 @@ config X86_MRST
 	  Unlike standard x86 PCs, Moorestown does not have many legacy devices
 	  nor standard legacy replacement devices/features. e.g. Moorestown does
 	  not contain i8259, i8254, HPET, legacy BIOS, most of the io ports.
+
+endif
 
 config X86_RDC321X
 	bool "RDC R-321x SoC"
@@ -2083,6 +2094,29 @@ config OLPC_XO1
 	depends on OLPC && MFD_CS5535
 	---help---
 	  Add support for non-essential features of the OLPC XO-1 laptop.
+
+config OLPC_XO1_RTC
+	bool "OLPC XO-1 Real Time Clock"
+	depends on OLPC_XO1_PM && RTC_DRV_CMOS
+	---help---
+	  Add support for the XO-1 real time clock, which can be used as a
+	  programmable wakeup source.
+
+config OLPC_XO15_SCI
+	bool "OLPC XO-1.5 SCI extras"
+	depends on OLPC && ACPI && POWER_SUPPLY
+	---help---
+	  Add support for SCI-based features of the OLPC XO-1.5 laptop:
+	   - EC-driven system wakeups
+	   - AC adapter status updates
+	   - Battery status updates
+
+config OLPC_XO1_PM
+ 	bool "OLPC XO-1 Power Management"
+	depends on OLPC && MFD_CS5535 && PM_SLEEP
+ 	select MFD_CORE
+ 	---help---
+	  Add support for poweroff and suspend of the OLPC XO-1 laptop.
 
 endif # X86_32
 

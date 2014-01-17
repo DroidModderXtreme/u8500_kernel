@@ -38,6 +38,10 @@
 #define MSR_MFGPT_NR		0x51400029
 #define MSR_MFGPT_SETUP		0x5140002B
 
+#define MSR_RTC_DOMA_OFFSET	0x51400055
+#define MSR_RTC_MONA_OFFSET	0x51400056
+#define MSR_RTC_CEN_OFFSET	0x51400057
+
 #define MSR_LX_SPARE_MSR	0x80000011	/* DC-specific */
 
 #define MSR_GX_GLD_MSR_CONFIG	0xC0002001
@@ -147,6 +151,12 @@ void cs5535_gpio_setup_event(unsigned offset, int pair, int pme);
 #define MFGPT_SETUP_EXTEN	(1 << 10)
 #define MFGPT_SETUP_REVEN	(1 << 5)
 #define MFGPT_SETUP_CLKSEL	(1 << 4)
+
+/* CS5536_PM1_EN bits */
+#define CS5536_PM_RTC		(1 << 10)
+
+/* CS5536_PM1_EN bits */
++#define CS5536_PM_PWRBTN	(1 << 8)
 
 struct cs5535_mfgpt_timer;
 
