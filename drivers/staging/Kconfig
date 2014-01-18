@@ -34,8 +34,6 @@ config AB5500_SIM
           Configure Operation Mode
           Notify Sim Insert/Extract Interrupt
 
-source "drivers/staging/tty/Kconfig"
-
 source "drivers/staging/et131x/Kconfig"
 
 source "drivers/staging/slicoss/Kconfig"
