@@ -1,0 +1,743 @@
+--- drivers/net/bnx2x/bnx2x_main.c
++++ drivers/net/bnx2x/bnx2x_main.c
+@@ -823,8 +824,9 @@
+ 			CHIP_IS_E1x(bp) ?
+ 			sb_data_e1x.index_data :
+ 			sb_data_e2.index_data;
+-		int data_size;
++		u8 data_size, cos;
+ 		u32 *sb_data_p;
++		struct bnx2x_fp_txdata txdata;
+ 
+ 		/* Rx */
+ 		BNX2X_ERR("fp%d: rx_bd_prod(0x%x)  rx_bd_cons(0x%x)"
+@@ -1678,6 +1694,11 @@
+ 		drv_cmd = BNX2X_Q_CMD_SETUP;
+ 		break;
+ 
++	case (RAMROD_CMD_ID_ETH_TX_QUEUE_SETUP):
++		DP(NETIF_MSG_IFUP, "got MULTI[%d] tx-only setup ramrod\n", cid);
++		drv_cmd = BNX2X_Q_CMD_SETUP_TX_ONLY;
++		break;
++
+ 	case (RAMROD_CMD_ID_ETH_HALT):
+ 		DP(NETIF_MSG_IFDOWN, "got MULTI[%d] halt ramrod\n", cid);
+ 		drv_cmd = BNX2X_Q_CMD_HALT;
+@@ -1754,11 +1776,12 @@
+ 	for_each_eth_queue(bp, i) {
+ 		struct bnx2x_fastpath *fp = &bp->fp[i];
+ 
+-		mask = 0x2 << (fp->index + CNIC_CONTEXT_USE);
++		mask = 0x2 << (fp->index + CNIC_PRESENT);
+ 		if (status & mask) {
+ 			/* Handle Rx or Tx according to SB id */
+ 			prefetch(fp->rx_cons_sb);
+-			prefetch(fp->tx_cons_sb);
++			for_each_cos_in_tx_queue(fp, cos)
++				prefetch(fp->txdata[cos].tx_cons_sb);
+ 			prefetch(&fp->sb_running_index[SM_RX_ID]);
+ 			napi_schedule(&bnx2x_fp(bp, fp->index, napi));
+ 			status &= ~mask;
+@@ -2648,15 +2671,43 @@
+ 	}
+ }
+ 
+-static inline unsigned long bnx2x_get_q_flags(struct bnx2x *bp,
+-					      struct bnx2x_fastpath *fp,
+-					      bool leading)
++/**
++ * bnx2x_get_tx_only_flags - Return common flags
++ *
++ * @bp		device handle
++ * @fp		queue handle
++ * @zero_stats	TRUE if statistics zeroing is needed
++ *
++ * Return the flags that are common for the Tx-only and not normal connections.
++ */
++static inline unsigned long bnx2x_get_common_flags(struct bnx2x *bp,
++						   struct bnx2x_fastpath *fp,
++						   bool zero_stats)
+ {
+ 	unsigned long flags = 0;
+ 
+ 	/* PF driver will always initialize the Queue to an ACTIVE state */
+ 	__set_bit(BNX2X_Q_FLG_ACTIVE, &flags);
+ 
++	/* tx only connections collect statistics (on the same index as the
++	 *  parent connection). The statistics are zeroed when the parent
++	 *  connection is initialized.
++	 */
++	if (stat_counter_valid(bp, fp)) {
++		__set_bit(BNX2X_Q_FLG_STATS, &flags);
++		if (zero_stats)
++			__set_bit(BNX2X_Q_FLG_ZERO_STATS, &flags);
++	}
++
++	return flags;
++}
++
++static inline unsigned long bnx2x_get_q_flags(struct bnx2x *bp,
++					      struct bnx2x_fastpath *fp,
++					      bool leading)
++{
++	unsigned long flags = 0;
++
+ 	/* calculate other queue flags */
+ 	if (IS_MF_SD(bp))
+ 		__set_bit(BNX2X_Q_FLG_OV, &flags);
+@@ -2667,11 +2718,6 @@
+ 	if (!fp->disable_tpa)
+ 		__set_bit(BNX2X_Q_FLG_TPA, &flags);
+ 
+-	if (stat_counter_valid(bp, fp)) {
+-		__set_bit(BNX2X_Q_FLG_STATS, &flags);
+-		__set_bit(BNX2X_Q_FLG_ZERO_STATS, &flags);
+-	}
+-
+ 	if (leading) {
+ 		__set_bit(BNX2X_Q_FLG_LEADING_RSS, &flags);
+ 		__set_bit(BNX2X_Q_FLG_MCAST, &flags);
+@@ -2680,11 +2726,13 @@
+ 	/* Always set HW VLAN stripping */
+ 	__set_bit(BNX2X_Q_FLG_VLAN, &flags);
+ 
+-	return flags;
++
++	return flags | bnx2x_get_common_flags(bp, fp, true);
+ }
+ 
+ static void bnx2x_pf_q_prep_general(struct bnx2x *bp,
+-	struct bnx2x_fastpath *fp, struct bnx2x_general_setup_params *gen_init)
++	struct bnx2x_fastpath *fp, struct bnx2x_general_setup_params *gen_init,
++	u8 cos)
+ {
+ 	gen_init->stat_id = bnx2x_stats_id(fp);
+ 	gen_init->spcl_id = fp->cl_id;
+@@ -2694,6 +2742,8 @@
+ 		gen_init->mtu = BNX2X_FCOE_MINI_JUMBO_MTU;
+ 	else
+ 		gen_init->mtu = bp->dev->mtu;
++
++	gen_init->cos = cos;
+ }
+ 
+ static void bnx2x_pf_rx_q_prep(struct bnx2x *bp,
+@@ -2761,14 +2811,15 @@
+ 	if (IS_FCOE_FP(fp))
+ 		rxq_init->sb_cq_index = HC_SP_INDEX_ETH_FCOE_RX_CQ_CONS;
+ 	else
+-		rxq_init->sb_cq_index = U_SB_ETH_RX_CQ_INDEX;
++		rxq_init->sb_cq_index = HC_INDEX_ETH_RX_CQ_CONS;
+ }
+ 
+ static void bnx2x_pf_tx_q_prep(struct bnx2x *bp,
+-	struct bnx2x_fastpath *fp, struct bnx2x_txq_setup_params *txq_init)
++	struct bnx2x_fastpath *fp, struct bnx2x_txq_setup_params *txq_init,
++	u8 cos)
+ {
+-	txq_init->dscr_map = fp->tx_desc_mapping;
+-	txq_init->sb_cq_index = C_SB_ETH_TX_CQ_INDEX;
++	txq_init->dscr_map = fp->txdata[cos].tx_desc_mapping;
++	txq_init->sb_cq_index = HC_INDEX_ETH_FIRST_TX_CQ_CONS + cos;
+ 	txq_init->traffic_type = LLFC_TRAFFIC_TYPE_NW;
+ 	txq_init->fw_sb_id = fp->fw_sb_id;
+ 
+@@ -2964,6 +3015,7 @@
+ static inline bool bnx2x_is_contextless_ramrod(int cmd, int cmd_type)
+ {
+ 	if ((cmd_type == NONE_CONNECTION_TYPE) ||
++	    (cmd == RAMROD_CMD_ID_ETH_FORWARD_SETUP) ||
+ 	    (cmd == RAMROD_CMD_ID_ETH_CLASSIFICATION_RULES) ||
+ 	    (cmd == RAMROD_CMD_ID_ETH_FILTER_RULES) ||
+ 	    (cmd == RAMROD_CMD_ID_ETH_MULTICAST_RULES) ||
+@@ -4286,12 +4338,13 @@
+ static inline struct bnx2x_queue_sp_obj *bnx2x_cid_to_q_obj(
+ 	struct bnx2x *bp, u32 cid)
+ {
++	DP(BNX2X_MSG_SP, "retrieving fp from cid %d", cid);
+ #ifdef BCM_CNIC
+ 	if (cid == BNX2X_FCOE_ETH_CID)
+ 		return &bnx2x_fcoe(bp, q_obj);
+ 	else
+ #endif
+-		return &bnx2x_fp(bp, cid, q_obj);
++		return &bnx2x_fp(bp, CID_TO_FP(cid), q_obj);
+ }
+ 
+ static void bnx2x_eq_int(struct bnx2x *bp)
+@@ -5060,12 +5122,12 @@
+ 
+ static inline u8 bnx2x_fp_igu_sb_id(struct bnx2x_fastpath *fp)
+ {
+-	return fp->bp->igu_base_sb + fp->index + CNIC_CONTEXT_USE;
++	return fp->bp->igu_base_sb + fp->index + CNIC_PRESENT;
+ }
+ 
+ static inline u8 bnx2x_fp_fw_sb_id(struct bnx2x_fastpath *fp)
+ {
+-	return fp->bp->base_fw_ndsb + fp->index + CNIC_CONTEXT_USE;
++	return fp->bp->base_fw_ndsb + fp->index + CNIC_PRESENT;
+ }
+ 
+ static inline u8 bnx2x_fp_cl_id(struct bnx2x_fastpath *fp)
+@@ -5076,10 +5138,12 @@
+ 		return bnx2x_fp_igu_sb_id(fp);
+ }
+ 
+-static void bnx2x_init_fp(struct bnx2x *bp, int fp_idx)
++static void bnx2x_init_eth_fp(struct bnx2x *bp, int fp_idx)
+ {
+ 	struct bnx2x_fastpath *fp = &bp->fp[fp_idx];
++	u8 cos;
+ 	unsigned long q_type = 0;
++	u32 cids[BNX2X_MULTI_TX_COS] = { 0 };
+ 
+ 	fp->cid = fp_idx;
+ 	fp->cl_id = bnx2x_fp_cl_id(fp);
+@@ -5092,14 +5156,25 @@
+ 	fp->ustorm_rx_prods_offset = bnx2x_rx_ustorm_prods_offset(fp);
+ 	/* Setup SB indicies */
+ 	fp->rx_cons_sb = BNX2X_RX_SB_INDEX;
+-	fp->tx_cons_sb = BNX2X_TX_SB_INDEX;
+ 
+ 	/* Configure Queue State object */
+ 	__set_bit(BNX2X_Q_TYPE_HAS_RX, &q_type);
+ 	__set_bit(BNX2X_Q_TYPE_HAS_TX, &q_type);
+-	bnx2x_init_queue_obj(bp, &fp->q_obj, fp->cl_id, fp->cid, BP_FUNC(bp),
+-		bnx2x_sp(bp, q_rdata), bnx2x_sp_mapping(bp, q_rdata),
+-			      q_type);
++
++	BUG_ON(fp->max_cos > BNX2X_MULTI_TX_COS);
++
++	/* init tx data */
++	for_each_cos_in_tx_queue(fp, cos) {
++		bnx2x_init_txdata(bp, &fp->txdata[cos],
++				  CID_COS_TO_TX_ONLY_CID(fp->cid, cos),
++				  FP_COS_TO_TXQ(fp, cos),
++				  BNX2X_TX_SB_INDEX_BASE + cos);
++		cids[cos] = fp->txdata[cos].cid;
++	}
++
++	bnx2x_init_queue_obj(bp, &fp->q_obj, fp->cl_id, cids, fp->max_cos,
++			     BP_FUNC(bp), bnx2x_sp(bp, q_rdata),
++			     bnx2x_sp_mapping(bp, q_rdata), q_type);
+ 
+ 	/**
+ 	 * Configure classification DBs: Always enable Tx switching
+@@ -5121,7 +5196,7 @@
+ 	int i;
+ 
+ 	for_each_eth_queue(bp, i)
+-		bnx2x_init_fp(bp, i);
++		bnx2x_init_eth_fp(bp, i);
+ #ifdef BCM_CNIC
+ 	if (!NO_FCOE(bp))
+ 		bnx2x_init_fcoe_fp(bp);
+@@ -7013,6 +7088,8 @@
+ static inline void bnx2x_pf_q_prep_init(struct bnx2x *bp,
+ 	struct bnx2x_fastpath *fp, struct bnx2x_queue_init_params *init_params)
+ {
++
++	u8 cos;
+ 	/* FCoE Queue uses Default SB, thus has no HC capabilities */
+ 	if (!IS_FCOE_FP(fp)) {
+ 		__set_bit(BNX2X_Q_FLG_HC, &init_params->rx.flags);
+@@ -7038,13 +7115,56 @@
+ 		 * CQ index among the SB indices: FCoE clients uses the default
+ 		 * SB, therefore it's different.
+ 		 */
+-		init_params->rx.sb_cq_index = U_SB_ETH_RX_CQ_INDEX;
+-		init_params->tx.sb_cq_index = C_SB_ETH_TX_CQ_INDEX;
++		init_params->rx.sb_cq_index = HC_INDEX_ETH_RX_CQ_CONS;
++		init_params->tx.sb_cq_index = HC_INDEX_ETH_FIRST_TX_CQ_CONS;
+ 	}
+ 
+-	init_params->cxt = &bp->context.vcxt[fp->cid].eth;
++	/* set maximum number of COSs supported by this queue */
++	init_params->max_cos = fp->max_cos;
++
++	DP(BNX2X_MSG_SP, "fp: %d setting queue params max cos to: %d",
++	    fp->index, init_params->max_cos);
++
++	/* set the context pointers queue object */
++	for (cos = FIRST_TX_COS_INDEX; cos < init_params->max_cos; cos++)
++		init_params->cxts[cos] =
++			&bp->context.vcxt[fp->txdata[cos].cid].eth;
+ }
+ 
++int bnx2x_setup_tx_only(struct bnx2x *bp, struct bnx2x_fastpath *fp,
++			struct bnx2x_queue_state_params *q_params,
++			struct bnx2x_queue_setup_tx_only_params *tx_only_params,
++			int tx_index, bool leading)
++{
++	memset(tx_only_params, 0, sizeof(*tx_only_params));
++
++	/* Set the command */
++	q_params->cmd = BNX2X_Q_CMD_SETUP_TX_ONLY;
++
++	/* Set tx-only QUEUE flags: don't zero statistics */
++	tx_only_params->flags = bnx2x_get_common_flags(bp, fp, false);
++
++	/* choose the index of the cid to send the slow path on */
++	tx_only_params->cid_index = tx_index;
++
++	/* Set general TX_ONLY_SETUP parameters */
++	bnx2x_pf_q_prep_general(bp, fp, &tx_only_params->gen_params, tx_index);
++
++	/* Set Tx TX_ONLY_SETUP parameters */
++	bnx2x_pf_tx_q_prep(bp, fp, &tx_only_params->txq_params, tx_index);
++
++	DP(BNX2X_MSG_SP, "preparing to send tx-only ramrod for connection:"
++			 "cos %d, primary cid %d, cid %d, "
++			 "client id %d, sp-client id %d, flags %lx",
++	   tx_index, q_params->q_obj->cids[FIRST_TX_COS_INDEX],
++	   q_params->q_obj->cids[tx_index], q_params->q_obj->cl_id,
++	   tx_only_params->gen_params.spcl_id, tx_only_params->flags);
++
++	/* send the ramrod */
++	return bnx2x_queue_state_change(bp, q_params);
++}
++
++
+ /**
+  * bnx2x_setup_queue - setup queue
+  *
+@@ -7062,7 +7182,12 @@
+ 	struct bnx2x_queue_state_params q_params = {0};
+ 	struct bnx2x_queue_setup_params *setup_params =
+ 						&q_params.params.setup;
++	struct bnx2x_queue_setup_tx_only_params *tx_only_params =
++						&q_params.params.tx_only;
+ 	int rc;
++	u8 tx_index;
++
++	DP(BNX2X_MSG_SP, "setting up queue %d", fp->index);
+ 
+ 	/* reset IGU state skip FCoE L2 queue */
+ 	if (!IS_FCOE_FP(fp))
+@@ -7082,10 +7207,13 @@
+ 	/* Change the state to INIT */
+ 	rc = bnx2x_queue_state_change(bp, &q_params);
+ 	if (rc) {
+-		BNX2X_ERR("Queue INIT failed\n");
++		BNX2X_ERR("Queue(%d) INIT failed\n", fp->index);
+ 		return rc;
+ 	}
+ 
++	DP(BNX2X_MSG_SP, "init complete");
++
++
+ 	/* Now move the Queue to the SETUP state... */
+ 	memset(setup_params, 0, sizeof(*setup_params));
+ 
+@@ -7093,20 +7221,39 @@
+ 	setup_params->flags = bnx2x_get_q_flags(bp, fp, leading);
+ 
+ 	/* Set general SETUP parameters */
+-	bnx2x_pf_q_prep_general(bp, fp, &setup_params->gen_params);
++	bnx2x_pf_q_prep_general(bp, fp, &setup_params->gen_params,
++				FIRST_TX_COS_INDEX);
+ 
+-	bnx2x_pf_rx_q_prep(bp, fp, &setup_params->pause,
++	bnx2x_pf_rx_q_prep(bp, fp, &setup_params->pause_params,
+ 			    &setup_params->rxq_params);
+ 
+-	bnx2x_pf_tx_q_prep(bp, fp, &setup_params->txq_params);
++	bnx2x_pf_tx_q_prep(bp, fp, &setup_params->txq_params,
++			   FIRST_TX_COS_INDEX);
+ 
+ 	/* Set the command */
+ 	q_params.cmd = BNX2X_Q_CMD_SETUP;
+ 
+ 	/* Change the state to SETUP */
+ 	rc = bnx2x_queue_state_change(bp, &q_params);
+-	if (rc)
+-		BNX2X_ERR("Queue SETUP failed\n");
++	if (rc) {
++		BNX2X_ERR("Queue(%d) SETUP failed\n", fp->index);
++		return rc;
++	}
++
++	/* loop through the relevant tx-only indices */
++	for (tx_index = FIRST_TX_ONLY_COS_INDEX;
++	      tx_index < fp->max_cos;
++	      tx_index++) {
++
++		/* prepare and send tx-only ramrod*/
++		rc = bnx2x_setup_tx_only(bp, fp, &q_params,
++					  tx_only_params, tx_index, leading);
++		if (rc) {
++			BNX2X_ERR("Queue(%d.%d) TX_ONLY_SETUP failed\n",
++				  fp->index, tx_index);
++			return rc;
++		}
++	}
+ 
+ 	return rc;
+ }
+@@ -7114,27 +7261,67 @@
+ static int bnx2x_stop_queue(struct bnx2x *bp, int index)
+ {
+ 	struct bnx2x_fastpath *fp = &bp->fp[index];
++	struct bnx2x_fp_txdata *txdata;
+ 	struct bnx2x_queue_state_params q_params = {0};
+-	int rc;
++	int rc, tx_index;
++
++	DP(BNX2X_MSG_SP, "stopping queue %d cid %d", index, fp->cid);
+ 
+ 	q_params.q_obj = &fp->q_obj;
+ 	/* We want to wait for completion in this context */
+ 	__set_bit(RAMROD_COMP_WAIT, &q_params.ramrod_flags);
+ 
+-	/* halt the connection */
++
++	/* close tx-only connections */
++	for (tx_index = FIRST_TX_ONLY_COS_INDEX;
++	     tx_index < fp->max_cos;
++	     tx_index++){
++
++		/* ascertain this is a normal queue*/
++		txdata = &fp->txdata[tx_index];
++
++		DP(BNX2X_MSG_SP, "stopping tx-only queue %d",
++							txdata->txq_index);
++
++		/* send halt terminate on tx-only connection */
++		q_params.cmd = BNX2X_Q_CMD_TERMINATE;
++		memset(&q_params.params.terminate, 0,
++		       sizeof(q_params.params.terminate));
++		q_params.params.terminate.cid_index = tx_index;
++
++		rc = bnx2x_queue_state_change(bp, &q_params);
++		if (rc)
++			return rc;
++
++		/* send halt terminate on tx-only connection */
++		q_params.cmd = BNX2X_Q_CMD_CFC_DEL;
++		memset(&q_params.params.cfc_del, 0,
++		       sizeof(q_params.params.cfc_del));
++		q_params.params.cfc_del.cid_index = tx_index;
++		rc = bnx2x_queue_state_change(bp, &q_params);
++		if (rc)
++			return rc;
++	}
++	/* Stop the primary connection: */
++	/* ...halt the connection */
+ 	q_params.cmd = BNX2X_Q_CMD_HALT;
+ 	rc = bnx2x_queue_state_change(bp, &q_params);
+ 	if (rc)
+ 		return rc;
+ 
+-	/* terminate the connection */
++	/* ...terminate the connection */
+ 	q_params.cmd = BNX2X_Q_CMD_TERMINATE;
++	memset(&q_params.params.terminate, 0,
++	       sizeof(q_params.params.terminate));
++	q_params.params.terminate.cid_index = FIRST_TX_COS_INDEX;
+ 	rc = bnx2x_queue_state_change(bp, &q_params);
+ 	if (rc)
+ 		return rc;
+-
+-	/* delete cfc entry */
++	/* ...delete cfc entry */
+ 	q_params.cmd = BNX2X_Q_CMD_CFC_DEL;
++	memset(&q_params.params.cfc_del, 0,
++	       sizeof(q_params.params.cfc_del));
++	q_params.params.cfc_del.cid_index = FIRST_TX_COS_INDEX;
+ 	return bnx2x_queue_state_change(bp, &q_params);
+ }
+ 
+@@ -7155,8 +7342,8 @@
+ 	for_each_eth_queue(bp, i) {
+ 		struct bnx2x_fastpath *fp = &bp->fp[i];
+ 		REG_WR8(bp, BAR_CSTRORM_INTMEM +
+-			CSTORM_STATUS_BLOCK_DATA_STATE_OFFSET(fp->fw_sb_id),
+-			SB_DISABLED);
++			   CSTORM_STATUS_BLOCK_DATA_STATE_OFFSET(fp->fw_sb_id),
++			   SB_DISABLED);
+ 	}
+ 
+ #ifdef BCM_CNIC
+@@ -7167,8 +7354,8 @@
+ #endif
+ 	/* SP SB */
+ 	REG_WR8(bp, BAR_CSTRORM_INTMEM +
+-		CSTORM_SP_STATUS_BLOCK_DATA_STATE_OFFSET(func),
+-		SB_DISABLED);
++		   CSTORM_SP_STATUS_BLOCK_DATA_STATE_OFFSET(func),
++		   SB_DISABLED);
+ 
+ 	for (i = 0; i < XSTORM_SPQ_DATA_SIZE / 4; i++)
+ 		REG_WR(bp, BAR_XSTRORM_INTMEM + XSTORM_SPQ_DATA_OFFSET(func),
+@@ -7377,7 +7564,8 @@
+ void bnx2x_chip_cleanup(struct bnx2x *bp, int unload_mode)
+ {
+ 	int port = BP_PORT(bp);
+-	int i, rc;
++	int i, rc = 0;
++	u8 cos;
+ 	struct bnx2x_mcast_ramrod_params rparam = {0};
+ 	u32 reset_code;
+ 
+@@ -7385,7 +7573,8 @@
+ 	for_each_tx_queue(bp, i) {
+ 		struct bnx2x_fastpath *fp = &bp->fp[i];
+ 
+-		rc = bnx2x_clean_tx_queue(bp, fp);
++		for_each_cos_in_tx_queue(fp, cos)
++			rc = bnx2x_clean_tx_queue(bp, &fp->txdata[cos]);
+ #ifdef BNX2X_STOP_ON_ERROR
+ 		if (rc)
+ 			return;
+@@ -7913,7 +8102,7 @@
+ 
+ /*
+  * Assumption: runs under rtnl lock. This together with the fact
+- * that it's called only from bnx2x_reset_task() ensure that it
++ * that it's called only from bnx2x_sp_rtnl() ensure that it
+  * will never be called when netif_running(bp->dev) is false.
+  */
+ static void bnx2x_parity_recover(struct bnx2x *bp)
+@@ -8070,6 +8259,9 @@
+ 	if (!netif_running(bp->dev))
+ 		goto sp_rtnl_exit;
+ 
++	if (test_and_clear_bit(BNX2X_SP_RTNL_SETUP_TC, &bp->sp_rtnl_state))
++		bnx2x_setup_tc(bp->dev, bp->dcbx_port_params.ets.num_of_cos);
++
+ 	/* if stop on error is defined no recovery flows should be executed */
+ #ifdef BNX2X_STOP_ON_ERROR
+ 	BNX2X_ERR("recovery flow called but STOP_ON_ERROR defined "
+@@ -8442,19 +8631,21 @@
+ 			else {
+ 				if (bp->igu_base_sb == 0xff)
+ 					bp->igu_base_sb = igu_sb_id;
+-				bp->igu_sb_cnt++;
++				igu_sb_cnt++;
+ 			}
+ 		}
+ 	}
+ 
+-	/* It's expected that number of CAM entries for this
+-	 * functions is equal to the MSI-X table size (which was a
+-	 * used during bp->l2_cid_count value calculation.
+-	 * We want a harsh warning if these values are different!
++#ifdef CONFIG_PCI_MSI
++	/*
++	 * It's expected that number of CAM entries for this functions is equal
++	 * to the number evaluated based on the MSI-X table size. We want a
++	 * harsh warning if these values are different!
+ 	 */
+-	WARN_ON(bp->igu_sb_cnt != NUM_IGU_SB_REQUIRED(bp->l2_cid_count));
++	WARN_ON(bp->igu_sb_cnt != igu_sb_cnt);
++#endif
+ 
+-	if (bp->igu_sb_cnt == 0)
++	if (igu_sb_cnt == 0)
+ 		BNX2X_ERR("CAM configuration error\n");
+ }
+ 
+@@ -9283,10 +9475,8 @@
+ 		SET_FLAGS(flags, MODE_E3);
+ 		if (CHIP_REV(bp) == CHIP_REV_Ax)
+ 			SET_FLAGS(flags, MODE_E3_A0);
+-		else {/*if (CHIP_REV(bp) == CHIP_REV_Bx)*/
+-			SET_FLAGS(flags, MODE_E3_B0);
+-			SET_FLAGS(flags, MODE_COS_BC);
+-		}
++		else /*if (CHIP_REV(bp) == CHIP_REV_Bx)*/
++			SET_FLAGS(flags, MODE_E3_B0 | MODE_COS3);
+ 	}
+ 
+ 	if (IS_MF(bp)) {
+@@ -10156,9 +10336,9 @@
+ }
+ 
+ /* must be called after sriov-enable */
+-static inline int bnx2x_set_qm_cid_count(struct bnx2x *bp, int l2_cid_count)
++static inline int bnx2x_set_qm_cid_count(struct bnx2x *bp)
+ {
+-	int cid_count = L2_FP_COUNT(l2_cid_count);
++	int cid_count = BNX2X_L2_CID_COUNT(bp);
+ 
+ #ifdef BCM_CNIC
+ 	cid_count += CNIC_CID_MAX;
+@@ -10167,22 +10347,33 @@
+ }
+ 
+ /**
+- * bnx2x_pci_msix_table_size - get the size of the MSI-X table.
++ * bnx2x_get_num_none_def_sbs - return the number of none default SBs
+  *
+  * @dev:	pci device
+  *
+  */
+-static inline int bnx2x_pci_msix_table_size(struct pci_dev *pdev)
++static inline int bnx2x_get_num_non_def_sbs(struct pci_dev *pdev)
+ {
+ 	int pos;
+ 	u16 control;
+ 
+ 	pos = pci_find_capability(pdev, PCI_CAP_ID_MSIX);
++
++	/*
++	 * If MSI-X is not supported - return number of SBs needed to support
++	 * one fast path queue: one FP queue + SB for CNIC
++	 */
+ 	if (!pos)
+-		return 0;
++		return 1 + CNIC_PRESENT;
+ 
++	/*
++	 * The value in the PCI configuration space is the index of the last
++	 * entry, namely one less than the actual size of the table, which is
++	 * exactly what we want to return from this function: number of all SBs
++	 * without the default SB.
++	 */
+ 	pci_read_config_word(pdev, pos  + PCI_MSI_FLAGS, &control);
+-	return (control & PCI_MSIX_FLAGS_QSIZE) + 1;
++	return control & PCI_MSIX_FLAGS_QSIZE;
+ }
+ 
+ static int __devinit bnx2x_init_one(struct pci_dev *pdev,
+@@ -10191,34 +10382,38 @@
+ 	struct net_device *dev = NULL;
+ 	struct bnx2x *bp;
+ 	int pcie_width, pcie_speed;
+-	int rc, cid_count;
++	int rc, max_non_def_sbs;
++	int rx_count, tx_count, rss_count;
++	/*
++	 * An estimated maximum supported CoS number according to the chip
++	 * version.
++	 * We will try to roughly estimate the maximum number of CoSes this chip
++	 * may support in order to minimize the memory allocated for Tx
++	 * netdev_queue's. This number will be accurately calculated during the
++	 * initialization of bp->max_cos based on the chip versions AND chip
++	 * revision in the bnx2x_init_bp().
++	 */
++	u8 max_cos_est = 0;
+ 
+ 	switch (ent->driver_data) {
+ 	case BCM57710:
+ 	case BCM57711:
+ 	case BCM57711E:
++		max_cos_est = BNX2X_MULTI_TX_COS_E1X;
++		break;
++
+ 	case BCM57712:
+ 	case BCM57712_MF:
++		max_cos_est = BNX2X_MULTI_TX_COS_E2_E3A0;
++		break;
++
+ 	case BCM57800:
+ 	case BCM57800_MF:
+ 	case BCM57810:
+ 	case BCM57810_MF:
+ 	case BCM57840:
+ 	case BCM57840_MF:
+-		/* The size requested for the MSI-X table corresponds to the
+-		 * actual amount of avaliable IGU/HC status blocks. It includes
+-		 * the default SB vector but we want cid_count to contain the
+-		 * amount of only non-default SBs, that's what '-1' stands for.
+-		 */
+-		cid_count = bnx2x_pci_msix_table_size(pdev) - 1;
+-
+-		/* do not allow initial cid_count grow above 16
+-		 * since Special CIDs starts from this number
+-		 * use old FP_SB_MAX_E1x define for this matter
+-		 */
+-		cid_count = min_t(int, FP_SB_MAX_E1x, cid_count);
+-
+-		WARN_ON(!cid_count);
++		max_cos_est = BNX2X_MULTI_TX_COS_E3B0;
+ 		break;
+ 
+ 	default:
+@@ -10227,26 +10422,44 @@
+ 		return -ENODEV;
+ 	}
+ 
+-	cid_count += FCOE_CONTEXT_USE;
++	max_non_def_sbs = bnx2x_get_num_non_def_sbs(pdev);
++
++	/* !!! FIXME !!!
++	 * Do not allow the maximum SB count to grow above 16
++	 * since Special CIDs starts from 16*BNX2X_MULTI_TX_COS=48.
++	 * We will use the FP_SB_MAX_E1x macro for this matter.
++	 */
++	max_non_def_sbs = min_t(int, FP_SB_MAX_E1x, max_non_def_sbs);
++
++	WARN_ON(!max_non_def_sbs);
++
++	/* Maximum number of RSS queues: one IGU SB goes to CNIC */
++	rss_count = max_non_def_sbs - CNIC_PRESENT;
++
++	/* Maximum number of netdev Rx queues: RSS + FCoE L2 */
++	rx_count = rss_count + FCOE_PRESENT;
++
++	/*
++	 * Maximum number of netdev Tx queues:
++	 *      Maximum TSS queues * Maximum supported number of CoS  + FCoE L2
++	 */
++	tx_count = MAX_TXQS_PER_COS * max_cos_est + FCOE_PRESENT;
+ 
+ 	/* dev zeroed in init_etherdev */
+-	dev = alloc_etherdev_mq(sizeof(*bp), cid_count);
++	dev = alloc_etherdev_mqs(sizeof(*bp), tx_count, rx_count);
+ 	if (!dev) {
+ 		dev_err(&pdev->dev, "Cannot allocate net device\n");
+ 		return -ENOMEM;
+ 	}
+ 
+-	/* We don't need a Tx queue for a CNIC and an OOO Rx-only ring,
+-	 * so update a cid_count after a netdev allocation.
+-	 */
+-	cid_count += CNIC_CONTEXT_USE;
+-
+ 	bp = netdev_priv(dev);
+-	bp->msg_enable = debug;
+ 
+-	pci_set_drvdata(pdev, dev);
++	DP(NETIF_MSG_DRV, "Allocated netdev with %d tx and %d rx queues\n",
++			  tx_count, rx_count);
+ 
+-	bp->l2_cid_count = cid_count;
++	bp->igu_sb_cnt = max_non_def_sbs;
++	bp->msg_enable = debug;
++	pci_set_drvdata(pdev, dev);
+ 
+ 	rc = bnx2x_init_dev(pdev, dev, ent->driver_data);
+ 	if (rc < 0) {
+@@ -10254,14 +10467,28 @@
+ 		return rc;
+ 	}
+ 
+-	BNX2X_DEV_INFO("cid_count=%d\n", cid_count);
++	DP(NETIF_MSG_DRV, "max_non_def_sbs %d", max_non_def_sbs);
+ 
+ 	rc = bnx2x_init_bp(bp);
+ 	if (rc)
+ 		goto init_one_exit;
+ 
++	/*
++	 * Map doorbels here as we need the real value of bp->max_cos which
++	 * is initialized in bnx2x_init_bp().
++	 */
++	bp->doorbells = ioremap_nocache(pci_resource_start(pdev, 2),
++					min_t(u64, BNX2X_DB_SIZE(bp),
++					      pci_resource_len(pdev, 2)));
++	if (!bp->doorbells) {
++		dev_err(&bp->pdev->dev,
++			"Cannot map doorbell space, aborting\n");
++		rc = -ENOMEM;
++		goto init_one_exit;
++	}
++
+ 	/* calc qm_cid_count */
+-	bp->qm_cid_count = bnx2x_set_qm_cid_count(bp, cid_count);
++	bp->qm_cid_count = bnx2x_set_qm_cid_count(bp);
+ 
+ #ifdef BCM_CNIC
+ 	/* disable FCOE L2 queue for E1x*/

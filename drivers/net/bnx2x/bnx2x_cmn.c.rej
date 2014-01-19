@@ -1,0 +1,174 @@
+--- drivers/net/bnx2x/bnx2x_cmn.c
++++ drivers/net/bnx2x/bnx2x_cmn.c
+@@ -110,11 +129,11 @@
+ 	prefetch(&skb->end);
+ 
+ 	DP(BNX2X_MSG_FP, "fp[%d]: pkt_idx %d  buff @(%p)->skb %p\n",
+-	   fp->index, idx, tx_buf, skb);
++	   txdata->txq_index, idx, tx_buf, skb);
+ 
+ 	/* unmap first bd */
+ 	DP(BNX2X_MSG_OFF, "free bd_idx %d\n", bd_idx);
+-	tx_start_bd = &fp->tx_desc_ring[bd_idx].start_bd;
++	tx_start_bd = &txdata->tx_desc_ring[bd_idx].start_bd;
+ 	dma_unmap_single(&bp->pdev->dev, BD_UNMAP_ADDR(tx_start_bd),
+ 			 BD_UNMAP_LEN(tx_start_bd), DMA_TO_DEVICE);
+ 
+@@ -1201,7 +1228,7 @@
+ {
+ 	if (bp->flags & USING_MSIX_FLAG)
+ 		bnx2x_free_msix_irqs(bp, BNX2X_NUM_ETH_QUEUES(bp) +
+-				     CNIC_CONTEXT_USE + 1);
++				     CNIC_PRESENT + 1);
+ 	else if (bp->flags & USING_MSI_FLAG)
+ 		free_irq(bp->pdev->irq, bp->dev);
+ 	else
+@@ -1445,20 +1472,38 @@
+ 	}
+ 
+ 	/* Add special queues */
+-	bp->num_queues += NONE_ETH_CONTEXT_USE;
++	bp->num_queues += NON_ETH_CONTEXT_USE;
+ }
+ 
+ static inline int bnx2x_set_real_num_queues(struct bnx2x *bp)
+ {
+-	int rc, num = bp->num_queues;
++	int rc, tx, rx;
+ 
+-#ifdef BCM_CNIC
+-	if (NO_FCOE(bp))
+-		num -= FCOE_CONTEXT_USE;
++	tx = MAX_TXQS_PER_COS * bp->max_cos;
++	rx = BNX2X_NUM_ETH_QUEUES(bp);
+ 
++/* account for fcoe queue */
++#ifdef BCM_CNIC
++	if (!NO_FCOE(bp)) {
++		rx += FCOE_PRESENT;
++		tx += FCOE_PRESENT;
++	}
+ #endif
+-	netif_set_real_num_tx_queues(bp->dev, num);
+-	rc = netif_set_real_num_rx_queues(bp->dev, num);
++
++	rc = netif_set_real_num_tx_queues(bp->dev, tx);
++	if (rc) {
++		BNX2X_ERR("Failed to set real number of Tx queues: %d\n", rc);
++		return rc;
++	}
++	rc = netif_set_real_num_rx_queues(bp->dev, rx);
++	if (rc) {
++		BNX2X_ERR("Failed to set real number of Rx queues: %d\n", rc);
++		return rc;
++	}
++
++	DP(NETIF_MSG_DRV, "Setting real num queues to (tx, rx) (%d, %d)\n",
++			  tx, rx);
++
+ 	return rc;
+ }
+ 
+@@ -1688,28 +1733,18 @@
+ 	/* must be called before memory allocation and HW init */
+ 	bnx2x_ilt_set_info(bp);
+ 
+-	/* zero fastpath structures preserving invariants like napi which are
+-	 * allocated only once
++	/*
++	 * Zero fastpath structures preserving invariants like napi, which are
++	 * allocated only once, fp index, max_cos, bp pointer.
++	 * Also set fp->disable_tpa.
+ 	 */
+ 	for_each_queue(bp, i)
+ 		bnx2x_bz_fp(bp, i);
+ 
++
+ 	/* Set the receive queues buffer size */
+ 	bnx2x_set_rx_buf_size(bp);
+ 
+-	/*
+-	 * set the tpa flag for each queue. The tpa flag determines the queue
+-	 * minimal size so it must be set prior to queue memory allocation
+-	 */
+-	for_each_queue(bp, i)
+-		bnx2x_fp(bp, i, disable_tpa) =
+-					((bp->flags & TPA_ENABLE_FLAG) == 0);
+-
+-#ifdef BCM_CNIC
+-	/* We don't want TPA on FCoE L2 ring */
+-	bnx2x_fcoe(bp, disable_tpa) = 1;
+-#endif
+-
+ 	if (bnx2x_alloc_mem(bp))
+ 		return -ENOMEM;
+ 
+@@ -2637,15 +2715,15 @@
+ 	/* get current pkt produced now - advance it just before sending packet
+ 	 * since mapping of pages may fail and cause packet to be dropped
+ 	 */
+-	pkt_prod = fp->tx_pkt_prod;
+-	bd_prod = TX_BD(fp->tx_bd_prod);
++	pkt_prod = txdata->tx_pkt_prod;
++	bd_prod = TX_BD(txdata->tx_bd_prod);
+ 
+ 	/* get a tx_buf and first BD
+ 	 * tx_start_bd may be changed during SPLIT,
+ 	 * but first_bd will always stay first
+ 	 */
+-	tx_buf = &fp->tx_buf_ring[TX_BD(pkt_prod)];
+-	tx_start_bd = &fp->tx_desc_ring[bd_prod].start_bd;
++	tx_buf = &txdata->tx_buf_ring[TX_BD(pkt_prod)];
++	tx_start_bd = &txdata->tx_desc_ring[bd_prod].start_bd;
+ 	first_bd = tx_start_bd;
+ 
+ 	tx_start_bd->bd_flags.as_bitfield = ETH_TX_BD_FLAGS_START_BD;
+@@ -2679,7 +2757,7 @@
+ 		bnx2x_set_sbd_csum(bp, skb, tx_start_bd, xmit_type);
+ 
+ 	if (!CHIP_IS_E1x(bp)) {
+-		pbd_e2 = &fp->tx_desc_ring[bd_prod].parse_bd_e2;
++		pbd_e2 = &txdata->tx_desc_ring[bd_prod].parse_bd_e2;
+ 		memset(pbd_e2, 0, sizeof(struct eth_tx_parse_bd_e2));
+ 		/* Set PBD in checksum offload case */
+ 		if (xmit_type & XMIT_CSUM)
+@@ -2733,8 +2811,9 @@
+ 		tx_start_bd->bd_flags.as_bitfield |= ETH_TX_BD_FLAGS_SW_LSO;
+ 
+ 		if (unlikely(skb_headlen(skb) > hlen))
+-			bd_prod = bnx2x_tx_split(bp, fp, tx_buf, &tx_start_bd,
+-						 hlen, bd_prod, ++nbd);
++			bd_prod = bnx2x_tx_split(bp, txdata, tx_buf,
++						 &tx_start_bd, hlen,
++						 bd_prod, ++nbd);
+ 		if (!CHIP_IS_E1x(bp))
+ 			bnx2x_set_pbd_gso_e2(skb, &pbd_e2_parsing_data,
+ 					     xmit_type);
+@@ -2768,14 +2847,15 @@
+ 			 * before call to bnx2x_free_tx_pkt
+ 			 */
+ 			first_bd->nbd = cpu_to_le16(nbd);
+-			bnx2x_free_tx_pkt(bp, fp, TX_BD(fp->tx_pkt_prod));
++			bnx2x_free_tx_pkt(bp, txdata,
++					  TX_BD(txdata->tx_pkt_prod));
+ 			return NETDEV_TX_OK;
+ 		}
+ 
+ 		bd_prod = TX_BD(NEXT_TX_IDX(bd_prod));
+-		tx_data_bd = &fp->tx_desc_ring[bd_prod].reg_bd;
++		tx_data_bd = &txdata->tx_desc_ring[bd_prod].reg_bd;
+ 		if (total_pkt_bd == NULL)
+-			total_pkt_bd = &fp->tx_desc_ring[bd_prod].reg_bd;
++			total_pkt_bd = &txdata->tx_desc_ring[bd_prod].reg_bd;
+ 
+ 		tx_data_bd->addr_hi = cpu_to_le32(U64_HI(mapping));
+ 		tx_data_bd->addr_lo = cpu_to_le32(U64_LO(mapping));
+@@ -2829,7 +2909,7 @@
+ 		   pbd_e2->parsing_data);
+ 	DP(NETIF_MSG_TX_QUEUED, "doorbell: nbd %d  bd %u\n", nbd, bd_prod);
+ 
+-	fp->tx_pkt_prod++;
++	txdata->tx_pkt_prod++;
+ 	/*
+ 	 * Make sure that the BD data is updated before updating the producer
+ 	 * since FW might read the BD right after the producer is updated.

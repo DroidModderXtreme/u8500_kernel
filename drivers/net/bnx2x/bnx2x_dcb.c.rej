@@ -1,0 +1,14 @@
+--- drivers/net/bnx2x/bnx2x_dcb.c
++++ drivers/net/bnx2x/bnx2x_dcb.c
+@@ -710,6 +730,11 @@
+ #endif
+ 			bnx2x_dcbx_stop_hw_tx(bp);
+ 
++			/* reconfigure the netdevice with the results of the new
++			 * dcbx negotiation.
++			 */
++			bnx2x_dcbx_update_tc_mapping(bp);
++
+ 			return;
+ 		}
+ 	case BNX2X_DCBX_STATE_TX_PAUSED:

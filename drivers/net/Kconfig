@@ -2197,15 +2197,6 @@ config IGBVF
 
 source "drivers/net/ixp2000/Kconfig"
 
-config MYRI_SBUS
-	tristate "MyriCOM Gigabit Ethernet support"
-	depends on SBUS
-	help
-	  This driver supports MyriCOM Sbus gigabit Ethernet cards.
-
-	  To compile this driver as a module, choose M here: the module
-	  will be called myri_sbus.  This is recommended.
-
 config NS83820
 	tristate "National Semiconductor DP83820 support"
 	depends on PCI
@@ -2312,6 +2303,15 @@ config SKGE_DEBUG
 	  transmit and receive rings.
 
 	  If unsure, say N.
+
+config SKGE_GENESIS
+       bool "Support for older SysKonnect Genesis boards"
+       depends on SKGE
+       help
+         This enables support for the older and uncommon SysKonnect Genesis
+	 chips, which support MII via an external transceiver, instead of
+	 an internal one. Disabling this option will save some memory
+	 by making code smaller. If unsure say Y.
 
 config SKY2
 	tristate "SysKonnect Yukon2 support"

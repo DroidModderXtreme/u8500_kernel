@@ -1,0 +1,93 @@
+--- drivers/net/bnx2x/bnx2x_cmn.h
++++ drivers/net/bnx2x/bnx2x_cmn.h
+@@ -976,7 +989,10 @@
+ 	/* Function parameters */
+ 	start_params->mf_mode = bp->mf_mode;
+ 	start_params->sd_vlan_tag = bp->mf_ov;
++	if (CHIP_IS_E1x(bp))
+ 		start_params->network_cos_mode = OVERRIDE_COS;
++	else
++		start_params->network_cos_mode = STATIC_COS;
+ 
+ 	return bnx2x_func_state_change(bp, &func_params);
+ }
+@@ -1272,12 +1290,23 @@
+ 		return USTORM_RX_PRODS_E1X_OFFSET(BP_PORT(bp), fp->cl_id);
+ }
+ 
++static inline void bnx2x_init_txdata(struct bnx2x *bp,
++	struct bnx2x_fp_txdata *txdata, u32 cid, int txq_index,
++	__le16 *tx_cons_sb)
++{
++	txdata->cid = cid;
++	txdata->txq_index = txq_index;
++	txdata->tx_cons_sb = tx_cons_sb;
++
++	DP(BNX2X_MSG_SP, "created tx data cid %d, txq %d",
++	   txdata->cid, txdata->txq_index);
++}
+ 
+ #ifdef BCM_CNIC
+ static inline u8 bnx2x_cnic_eth_cl_id(struct bnx2x *bp, u8 cl_idx)
+ {
+ 	return bp->cnic_base_cl_id + cl_idx +
+-		(bp->pf_num >> 1) * NONE_ETH_CONTEXT_USE;
++		(bp->pf_num >> 1) * NON_ETH_CONTEXT_USE;
+ }
+ 
+ static inline u8 bnx2x_cnic_fw_sb_id(struct bnx2x *bp)
+@@ -1308,10 +1337,13 @@
+ 	bnx2x_fcoe(bp, cid) = BNX2X_FCOE_ETH_CID;
+ 	bnx2x_fcoe(bp, fw_sb_id) = DEF_SB_ID;
+ 	bnx2x_fcoe(bp, igu_sb_id) = bp->igu_dsb_id;
+-	bnx2x_fcoe(bp, bp) = bp;
+-	bnx2x_fcoe(bp, index) = FCOE_IDX;
+ 	bnx2x_fcoe(bp, rx_cons_sb) = BNX2X_FCOE_L2_RX_INDEX;
+-	bnx2x_fcoe(bp, tx_cons_sb) = BNX2X_FCOE_L2_TX_INDEX;
++
++	bnx2x_init_txdata(bp, &bnx2x_fcoe(bp, txdata[0]),
++			  fp->cid, FCOE_TXQ_IDX(bp), BNX2X_FCOE_L2_TX_INDEX);
++
++	DP(BNX2X_MSG_SP, "created fcoe tx data (fp index %d)", fp->index);
++
+ 	/* qZone id equals to FW (per path) client id */
+ 	bnx2x_fcoe(bp, cl_qzone_id) = bnx2x_fp_qzone_id(fp);
+ 	/* init shortcut */
+@@ -1321,9 +1353,13 @@
+ 	/* Configure Queue State object */
+ 	__set_bit(BNX2X_Q_TYPE_HAS_RX, &q_type);
+ 	__set_bit(BNX2X_Q_TYPE_HAS_TX, &q_type);
+-	bnx2x_init_queue_obj(bp, &fp->q_obj, fp->cl_id, fp->cid, BP_FUNC(bp),
+-		bnx2x_sp(bp, q_rdata), bnx2x_sp_mapping(bp, q_rdata),
+-			      q_type);
++
++	/* No multi-CoS for FCoE L2 client */
++	BUG_ON(fp->max_cos != 1);
++
++	bnx2x_init_queue_obj(bp, &fp->q_obj, fp->cl_id, &fp->cid, 1,
++			     BP_FUNC(bp), bnx2x_sp(bp, q_rdata),
++			     bnx2x_sp_mapping(bp, q_rdata), q_type);
+ 
+ 	DP(NETIF_MSG_IFUP, "queue[%d]: bnx2x_init_sb(%p,%p) cl_id %d fw_sb %d "
+ 			   "igu_sb %d\n",
+@@ -1333,15 +1369,16 @@
+ #endif
+ 
+ static inline int bnx2x_clean_tx_queue(struct bnx2x *bp,
+-				       struct bnx2x_fastpath *fp)
++				       struct bnx2x_fp_txdata *txdata)
+ {
+ 	int cnt = 1000;
+ 
+-	while (bnx2x_has_tx_work_unload(fp)) {
++	while (bnx2x_has_tx_work_unload(txdata)) {
+ 		if (!cnt) {
+ 			BNX2X_ERR("timeout waiting for queue[%d]: "
+-				 "fp->tx_pkt_prod(%d) != fp->tx_pkt_cons(%d)\n",
+-				  fp->index, fp->tx_pkt_prod, fp->tx_pkt_cons);
++				 "txdata->tx_pkt_prod(%d) != txdata->tx_pkt_cons(%d)\n",
++				  txdata->txq_index, txdata->tx_pkt_prod,
++				  txdata->tx_pkt_cons);
+ #ifdef BNX2X_STOP_ON_ERROR
+ 			bnx2x_panic();
+ 			return -EBUSY;
