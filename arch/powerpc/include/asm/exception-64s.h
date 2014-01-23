@@ -177,6 +177,10 @@ label##_hv:						\
 	SET_SCRATCH0(r13);	/* save r13 */		\
 	EXCEPTION_PROLOG_PSERIES(PACA_EXGEN, label##_common, EXC_HV)
 
+#define SOFTEN_TEST_HV_201(vec)						\
+	KVMTEST(vec);							\
+	_SOFTEN_TEST(EXC_STD)
+
 #define __MASKABLE_EXCEPTION_PSERIES(vec, label, h)			\
 	HMT_MEDIUM;							\
 	DO_KVM	vec;							\

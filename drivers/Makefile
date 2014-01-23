@@ -134,6 +134,9 @@ obj-$(CONFIG_AUTHENTEC_VPNCLIENT_INTERCEPTOR) += interceptor/
 
 obj-$(CONFIG_BATTERY_SAMSUNG)	+= battery/
 
+# Virtualization drivers
+obj-$(CONFIG_VIRT_DRIVERS)	+= virt/
+
 ifeq (1, $(shell if [ -d ../../../../../../kernel/drivers/exfat ]; then echo 1; fi))
 obj-y   += exfat/
 endif

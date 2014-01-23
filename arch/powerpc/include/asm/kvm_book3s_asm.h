@@ -81,6 +81,8 @@ struct kvmppc_book3s_shadow_vcpu {
 	ulong vmhandler;
 	u8 in_guest;
 
+	u32 host_pmc[8];
+
 #ifdef CONFIG_PPC_BOOK3S_32
 	u32     sr[16];			/* Guest SRs */
 #endif
