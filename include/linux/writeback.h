@@ -56,11 +56,10 @@ enum writeback_sync_modes {
  */
 struct writeback_control {
 	enum writeback_sync_modes sync_mode;
-	unsigned long *older_than_this;	/* If !NULL, only write back inodes
-					   older than this */
-	unsigned long wb_start;         /* Time writeback_inodes_wb was
-					   called. This is needed to avoid
-					   extra jobs and livelock */
+	unsigned long *older_than_this;		/* If !NULL, only write back inodes */
+	unsigned long wb_start;		/* Time writeback_inodes_wb was
+						   called. This is needed to avoid
+						   extra jobs and livelock */
 	long nr_to_write;		/* Write this many pages, and decrement
 					   this for each page written */
 	long pages_skipped;		/* Pages which were not written */
@@ -74,13 +73,13 @@ struct writeback_control {
 	loff_t range_end;
 
 	unsigned nonblocking:1;		/* Don't get stuck on request queues */
-	unsigned encountered_congestion:1; /* An output: a queue is full */
+	unsigned encountered_congestion:1;	/* An output: a queue is full */
 	unsigned for_kupdate:1;		/* A kupdate writeback */
-	unsigned for_background:1;	/* A background writeback */
+	unsigned for_background:1;		/* A background writeback */
 	unsigned tagged_writepages:1;	/* tag-and-write to avoid livelock */
 	unsigned for_reclaim:1;		/* Invoked from the page allocator */
-	unsigned range_cyclic:1;	/* range_start is cyclic */
-	unsigned more_io:1;		/* more io to be dispatched */
+	unsigned range_cyclic:1;		/* range_start is cyclic */
+	unsigned more_io:1;			/* more io to be dispatched */
 };
 
 /*
@@ -93,8 +92,7 @@ void writeback_inodes_sb_nr(struct super_block *, unsigned long nr);
 int writeback_inodes_sb_if_idle(struct super_block *);
 int writeback_inodes_sb_nr_if_idle(struct super_block *, unsigned long nr);
 void sync_inodes_sb(struct super_block *);
-void writeback_inodes_wb(struct bdi_writeback *wb,
-		struct writeback_control *wbc);
+long writeback_inodes_wb(struct bdi_writeback *wb, long nr_pages);
 long wb_do_writeback(struct bdi_writeback *wb, int force_wait);
 void wakeup_flusher_threads(long nr_pages);
 
@@ -160,6 +158,10 @@ unsigned long bdi_dirty_limit(struct backing_dev_info *bdi,
 			       unsigned long dirty);
 
 void __bdi_update_bandwidth(struct backing_dev_info *bdi,
+			    unsigned long thresh,
+			    unsigned long dirty,
+			    unsigned long bdi_thresh,
+			    unsigned long bdi_dirty,
 			    unsigned long start_time);
 
 void page_writeback_init(void);

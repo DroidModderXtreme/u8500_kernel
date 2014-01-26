@@ -51,6 +51,7 @@ static struct vfsmount *shm_mnt;
 #include <linux/shmem_fs.h>
 #include <linux/writeback.h>
 #include <linux/blkdev.h>
+#include <linux/splice.h>
 #include <linux/security.h>
 #include <linux/swapops.h>
 #include <linux/mempolicy.h>
@@ -661,132 +662,102 @@ static inline struct mempolicy *shmem_get_sbmpol(struct shmem_sb_info *sbinfo)
  * vm. If we swap it in we mark it dirty since we also free the swap
  * entry since a page cannot live in both the swap and page cache
  */
-static int shmem_getpage(struct inode *inode, unsigned long idx,
-			struct page **pagep, enum sgp_type sgp, int *type)
+static int shmem_getpage_gfp(struct inode *inode, pgoff_t idx,
+	struct page **pagep, enum sgp_type sgp, gfp_t gfp, int *fault_type)
 {
 	struct address_space *mapping = inode->i_mapping;
 	struct shmem_inode_info *info = SHMEM_I(inode);
 	struct shmem_sb_info *sbinfo;
-	struct page *filepage = *pagep;
-	struct page *swappage;
+	struct page *page;
 	struct page *prealloc_page = NULL;
 	swp_entry_t swap;
-	gfp_t gfp;
 	int error;
 
 	if (idx > (MAX_LFS_FILESIZE >> PAGE_CACHE_SHIFT))
 		return -EFBIG;
-
-	if (type)
-		*type = 0;
+repeat:
+	page = find_lock_page(mapping, idx);
+	if (page) {
+		/*
+		 * Once we can get the page lock, it must be uptodate:
+		 * if there were an error in reading back from swap,
+		 * the page would not be inserted into the filecache.
+		 */
+		BUG_ON(!PageUptodate(page));
+		goto done;
+	}
 
 	/*
-	 * Normally, filepage is NULL on entry, and either found
-	 * uptodate immediately, or allocated and zeroed, or read
-	 * in under swappage, which is then assigned to filepage.
-	 * But shmem_readpage (required for splice) passes in a locked
-	 * filepage, which may be found not uptodate by other callers
-	 * too, and may need to be copied from the swappage read in.
+	 * Try to preload while we can wait, to not make a habit of
+	 * draining atomic reserves; but don't latch on to this cpu.
 	 */
-repeat:
-	if (!filepage)
-		filepage = find_lock_page(mapping, idx);
-	if (filepage && PageUptodate(filepage))
-		goto done;
-	gfp = mapping_gfp_mask(mapping);
-	if (!filepage) {
-		/*
-		 * Try to preload while we can wait, to not make a habit of
-		 * draining atomic reserves; but don't latch on to this cpu.
-		 */
-		error = radix_tree_preload(gfp & ~__GFP_HIGHMEM);
-		if (error)
-			goto failed;
-		radix_tree_preload_end();
-		if (sgp != SGP_READ && !prealloc_page) {
-			/* We don't care if this fails */
-			prealloc_page = shmem_alloc_page(gfp, info, idx);
-			if (prealloc_page) {
-				if (mem_cgroup_cache_charge(prealloc_page,
-						current->mm, GFP_KERNEL)) {
-					page_cache_release(prealloc_page);
-					prealloc_page = NULL;
-				}
+	error = radix_tree_preload(gfp & GFP_RECLAIM_MASK);
+	if (error)
+		goto out;
+	radix_tree_preload_end();
+
+	if (sgp != SGP_READ && !prealloc_page) {
+		prealloc_page = shmem_alloc_page(gfp, info, idx);
+		if (prealloc_page) {
+			SetPageSwapBacked(prealloc_page);
+			if (mem_cgroup_cache_charge(prealloc_page,
+					current->mm, GFP_KERNEL)) {
+				page_cache_release(prealloc_page);
+				prealloc_page = NULL;
 			}
 		}
 	}
-	error = 0;
 
 	spin_lock(&info->lock);
 	shmem_recalc_inode(inode);
 	swap = shmem_get_swap(info, idx);
-
 	if (swap.val) {
 		/* Look it up and read it in.. */
-		swappage = lookup_swap_cache(swap);
-		if (!swappage) {
+		page = lookup_swap_cache(swap);
+		if (!page) {
 			spin_unlock(&info->lock);
 			/* here we actually do the io */
-			if (type)
-				*type |= VM_FAULT_MAJOR;
-			swappage = shmem_swapin(swap, gfp, info, idx);
-			if (!swappage) {
+			if (fault_type)
+				*fault_type |= VM_FAULT_MAJOR;
+			page = shmem_swapin(swap, gfp, info, idx);
+			if (!page) {
 				swp_entry_t nswap = shmem_get_swap(info, idx);
 				if (nswap.val == swap.val) {
 					error = -ENOMEM;
-					goto failed;
+					goto out;
 				}
 				goto repeat;
 			}
-			wait_on_page_locked(swappage);
-			page_cache_release(swappage);
+			wait_on_page_locked(page);
+			page_cache_release(page);
 			goto repeat;
 		}
 
 		/* We have to do this with page locked to prevent races */
-		if (!trylock_page(swappage)) {
+		if (!trylock_page(page)) {
 			spin_unlock(&info->lock);
-			wait_on_page_locked(swappage);
-			page_cache_release(swappage);
+			wait_on_page_locked(page);
+			page_cache_release(page);
 			goto repeat;
 		}
-		if (PageWriteback(swappage)) {
+		if (PageWriteback(page)) {
 			spin_unlock(&info->lock);
-			wait_on_page_writeback(swappage);
-			unlock_page(swappage);
-			page_cache_release(swappage);
+			wait_on_page_writeback(page);
+			unlock_page(page);
+			page_cache_release(page);
 			goto repeat;
 		}
-		if (!PageUptodate(swappage)) {
+		if (!PageUptodate(page)) {
 			spin_unlock(&info->lock);
-			unlock_page(swappage);
-			page_cache_release(swappage);
+			unlock_page(page);
+			page_cache_release(page);
 			error = -EIO;
-			goto failed;
+			goto out;
 		}
 
-		if (filepage) {
-			shmem_swp_set(info, entry, 0);
-			shmem_swp_unmap(entry);
-			delete_from_swap_cache(swappage);
-			spin_unlock(&info->lock);
-			copy_highpage(filepage, swappage);
-			unlock_page(swappage);
-			page_cache_release(swappage);
-			flush_dcache_page(filepage);
-			SetPageUptodate(filepage);
-			set_page_dirty(filepage);
-			swap_free(swap);
-		} else if (!(error = add_to_page_cache_locked(swappage, mapping,
-					idx, GFP_NOWAIT))) {
-			delete_from_swap_cache(swappage);
-			shmem_put_swap(info, idx, (swp_entry_t){0});
-			info->swapped--;
-			spin_unlock(&info->lock);
-			filepage = swappage;
-			set_page_dirty(filepage);
-			swap_free(swap);
-		} else {
+		error = add_to_page_cache_locked(page, mapping,
+						 idx, GFP_NOWAIT);
+		if (error) {
 			spin_unlock(&info->lock);
 			if (error == -ENOMEM) {
 				/*
@@ -794,32 +765,36 @@ repeat:
 				 * call memcg's OOM if needed.
 				 */
 				error = mem_cgroup_shmem_charge_fallback(
-								swappage,
-								current->mm,
-								gfp);
+						page, current->mm, gfp);
 				if (error) {
-					unlock_page(swappage);
-					page_cache_release(swappage);
-					goto failed;
+					unlock_page(page);
+					page_cache_release(page);
+					goto out;
 				}
 			}
-			unlock_page(swappage);
-			page_cache_release(swappage);
+			unlock_page(page);
+			page_cache_release(page);
 			goto repeat;
 		}
-	} else if (sgp == SGP_READ && !filepage) {
-		filepage = find_get_page(mapping, idx);
-		if (filepage &&
-		    (!PageUptodate(filepage) || !trylock_page(filepage))) {
+
+		delete_from_swap_cache(page);
+		shmem_put_swap(info, idx, (swp_entry_t){0});
+		info->swapped--;
+		spin_unlock(&info->lock);
+		set_page_dirty(page);
+		swap_free(swap);
+
+	} else if (sgp == SGP_READ) {
+		page = find_get_page(mapping, idx);
+		if (page && !trylock_page(page)) {
 			spin_unlock(&info->lock);
-			wait_on_page_locked(filepage);
-			page_cache_release(filepage);
-			filepage = NULL;
+			wait_on_page_locked(page);
+			page_cache_release(page);
 			goto repeat;
 		}
 		spin_unlock(&info->lock);
-	} else {
-		shmem_swp_unmap(entry);
+
+	} else if (prealloc_page) {
 		sbinfo = SHMEM_SB(inode->i_sb);
 		if (sbinfo->max_blocks) {
 			if (percpu_counter_compare(&sbinfo->used_blocks,
@@ -827,110 +802,69 @@ repeat:
 			    shmem_acct_block(info->flags))
 				goto nospace;
 			percpu_counter_inc(&sbinfo->used_blocks);
-			spin_lock(&inode->i_lock);
 			inode->i_blocks += BLOCKS_PER_PAGE;
-			spin_unlock(&inode->i_lock);
 		} else if (shmem_acct_block(info->flags))
 			goto nospace;
 
-		if (!filepage) {
-			int ret;
+		page = prealloc_page;
+		prealloc_page = NULL;
 
-			if (!prealloc_page) {
-				spin_unlock(&info->lock);
-				filepage = shmem_alloc_page(gfp, info, idx);
-				if (!filepage) {
-					shmem_unacct_blocks(info->flags, 1);
-					shmem_free_blocks(inode, 1);
-					error = -ENOMEM;
-					goto failed;
-				}
-				SetPageSwapBacked(filepage);
-
-				/*
-				 * Precharge page while we can wait, compensate
-				 * after
-				 */
-				error = mem_cgroup_cache_charge(filepage,
-					current->mm, GFP_KERNEL);
-				if (error) {
-					page_cache_release(filepage);
-					shmem_unacct_blocks(info->flags, 1);
-					shmem_free_blocks(inode, 1);
-					filepage = NULL;
-					goto failed;
-				}
-
-				spin_lock(&info->lock);
-			} else {
-				filepage = prealloc_page;
-				prealloc_page = NULL;
-				SetPageSwapBacked(filepage);
-			}
-
-			swap = shmem_get_swap(info, idx);
-			if (swap.val)
-				mem_cgroup_uncharge_cache_page(filepage);
-			else
-				error = add_to_page_cache_lru(page, mapping,
+		swap = shmem_get_swap(info, idx);
+		if (swap.val)
+			mem_cgroup_uncharge_cache_page(page);
+		else
+			error = add_to_page_cache_lru(page, mapping,
 						idx, GFP_NOWAIT);
-			/*
-			 * At add_to_page_cache_lru() failure, uncharge will
-			 * be done automatically.
-			 */
-			if (swap.val || error) {
-				spin_unlock(&info->lock);
-				page_cache_release(filepage);
-				shmem_unacct_blocks(info->flags, 1);
-				shmem_free_blocks(inode, 1);
-				filepage = NULL;
-				goto repeat;
-			}
-			info->flags |= SHMEM_PAGEIN;
-		}
-
-		info->alloced++;
-		spin_unlock(&info->lock);
-		clear_highpage(filepage);
-		flush_dcache_page(filepage);
-		SetPageUptodate(filepage);
-		if (sgp == SGP_DIRTY)
-			set_page_dirty(filepage);
-	}
-done:
-	*pagep = filepage;
-	error = 0;
-	goto out;
-
-nospace:
-	/*
-	 * Perhaps the page was brought in from swap between find_lock_page
-	 * and taking info->lock?  We allow for that at add_to_page_cache_lru,
-	 * but must also avoid reporting a spurious ENOSPC while working on a
-	 * full tmpfs.  (When filepage has been passed in to shmem_getpage, it
-	 * is already in page cache, which prevents this race from occurring.)
-	 */
-	if (!filepage) {
-		struct page *page = find_get_page(mapping, idx);
-		if (page) {
+		/*
+		 * At add_to_page_cache_lru() failure,
+		 * uncharge will be done automatically.
+		 */
+		if (swap.val || error) {
+			shmem_unacct_blocks(info->flags, 1);
+			shmem_free_blocks(inode, 1);
 			spin_unlock(&info->lock);
 			page_cache_release(page);
 			goto repeat;
 		}
+
+		info->alloced++;
+		spin_unlock(&info->lock);
+		clear_highpage(page);
+		flush_dcache_page(page);
+		SetPageUptodate(page);
+		if (sgp == SGP_DIRTY)
+			set_page_dirty(page);
+
+	} else {
+		spin_unlock(&info->lock);
+		error = -ENOMEM;
+		goto out;
 	}
-	spin_unlock(&info->lock);
-	error = -ENOSPC;
-failed:
-	if (*pagep != filepage) {
-		unlock_page(filepage);
-		page_cache_release(filepage);
-	}
+done:
+	*pagep = page;
+	error = 0;
 out:
 	if (prealloc_page) {
 		mem_cgroup_uncharge_cache_page(prealloc_page);
 		page_cache_release(prealloc_page);
 	}
 	return error;
+
+nospace:
+	/*
+	 * Perhaps the page was brought in from swap between find_lock_page
+	 * and taking info->lock?  We allow for that at add_to_page_cache_lru,
+	 * but must also avoid reporting a spurious ENOSPC while working on a
+	 * full tmpfs.
+	 */
+	page = find_get_page(mapping, idx);
+	spin_unlock(&info->lock);
+	if (page) {
+		page_cache_release(page);
+		goto repeat;
+	}
+	error = -ENOSPC;
+	goto out;
 }
 
 static int shmem_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
