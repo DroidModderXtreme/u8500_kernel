@@ -433,7 +433,6 @@ void __ext4_error(struct super_block *sb, const char *function,
 	printk(KERN_CRIT "EXT4-fs error (device %s): %s:%d: comm %s: %pV\n",
 	       sb->s_id, function, line, current->comm, &vaf);
 	va_end(args);
-	save_error_info(sb, function, line);
 
 	ext4_handle_error(sb);
 }
@@ -860,7 +859,6 @@ static struct inode *ext4_alloc_inode(struct super_block *sb)
 	ei->i_reserved_meta_blocks = 0;
 	ei->i_allocated_meta_blocks = 0;
 	ei->i_da_metadata_calc_len = 0;
-	ei->i_da_metadata_calc_last_lblock = 0;
 	spin_lock_init(&(ei->i_block_reservation_lock));
 #ifdef CONFIG_QUOTA
 	ei->i_reserved_quota = 0;
@@ -894,6 +892,7 @@ static void ext4_i_callback(struct rcu_head *head)
 
 static void ext4_destroy_inode(struct inode *inode)
 {
+	ext4_ioend_wait(inode);
 	if (!list_empty(&(EXT4_I(inode)->i_orphan))) {
 		ext4_msg(inode->i_sb, KERN_ERR,
 			 "Inode %lu (%p): orphan list check failed!",
@@ -1115,9 +1114,9 @@ static int ext4_show_options(struct seq_file *seq, struct vfsmount *vfs)
 		seq_puts(seq, ",block_validity");
 
 	if (!test_opt(sb, INIT_INODE_TABLE))
-		seq_puts(seq, ",noinit_itable");
+		seq_puts(seq, ",noinit_inode_table");
 	else if (sbi->s_li_wait_mult != EXT4_DEF_LI_WAIT_MULT)
-		seq_printf(seq, ",init_itable=%u",
+		seq_printf(seq, ",init_inode_table=%u",
 			   (unsigned) sbi->s_li_wait_mult);
 
 	ext4_show_quota_options(seq, sb);
@@ -1293,7 +1292,8 @@ enum {
 	Opt_nomblk_io_submit, Opt_block_validity, Opt_noblock_validity,
 	Opt_inode_readahead_blks, Opt_journal_ioprio,
 	Opt_dioread_nolock, Opt_dioread_lock,
-	Opt_discard, Opt_nodiscard, Opt_init_itable, Opt_noinit_itable,
+	Opt_discard, Opt_nodiscard,
+	Opt_init_inode_table, Opt_noinit_inode_table,
 };
 
 static const match_table_t tokens = {
@@ -1366,9 +1366,9 @@ static const match_table_t tokens = {
 	{Opt_dioread_lock, "dioread_lock"},
 	{Opt_discard, "discard"},
 	{Opt_nodiscard, "nodiscard"},
-	{Opt_init_itable, "init_itable=%u"},
-	{Opt_init_itable, "init_itable"},
-	{Opt_noinit_itable, "noinit_itable"},
+	{Opt_init_inode_table, "init_itable=%u"},
+	{Opt_init_inode_table, "init_itable"},
+	{Opt_noinit_inode_table, "noinit_itable"},
 	{Opt_err, NULL},
 };
 
@@ -1845,7 +1845,7 @@ set_qf_format:
 		case Opt_dioread_lock:
 			clear_opt(sb, DIOREAD_NOLOCK);
 			break;
-		case Opt_init_itable:
+		case Opt_init_inode_table:
 			set_opt(sb, INIT_INODE_TABLE);
 			if (args[0].from) {
 				if (match_int(&args[0], &option))
@@ -1856,7 +1856,7 @@ set_qf_format:
 				return 0;
 			sbi->s_li_wait_mult = option;
 			break;
-		case Opt_noinit_itable:
+		case Opt_noinit_inode_table:
 			clear_opt(sb, INIT_INODE_TABLE);
 			break;
 		default:
@@ -1959,16 +1959,17 @@ static int ext4_fill_flex_info(struct super_block *sb)
 	struct ext4_group_desc *gdp = NULL;
 	ext4_group_t flex_group_count;
 	ext4_group_t flex_group;
-	unsigned int groups_per_flex = 0;
+	int groups_per_flex = 0;
 	size_t size;
 	int i;
 
 	sbi->s_log_groups_per_flex = sbi->s_es->s_log_groups_per_flex;
-	if (sbi->s_log_groups_per_flex < 1 || sbi->s_log_groups_per_flex > 31) {
+	groups_per_flex = 1 << sbi->s_log_groups_per_flex;
+
+	if (groups_per_flex < 2) {
 		sbi->s_log_groups_per_flex = 0;
 		return 1;
 	}
-	groups_per_flex = 1 << sbi->s_log_groups_per_flex;
 
 	/* We allocate both existing and potentially added groups */
 	flex_group_count = ((sbi->s_groups_count + groups_per_flex - 1) +
@@ -1992,8 +1993,8 @@ static int ext4_fill_flex_info(struct super_block *sb)
 		flex_group = ext4_flex_group(sbi, i);
 		atomic_add(ext4_free_inodes_count(sb, gdp),
 			   &sbi->s_flex_groups[flex_group].free_inodes);
-		atomic64_add(ext4_free_blks_count(sb, gdp),
-			     &sbi->s_flex_groups[flex_group].free_blocks);
+		atomic_add(ext4_free_blks_count(sb, gdp),
+			   &sbi->s_flex_groups[flex_group].free_blocks);
 		atomic_add(ext4_used_dirs_count(sb, gdp),
 			   &sbi->s_flex_groups[flex_group].used_dirs);
 	}
@@ -2204,9 +2205,7 @@ static void ext4_orphan_cleanup(struct super_block *sb,
 				__func__, inode->i_ino, inode->i_size);
 			jbd_debug(2, "truncating inode %lu to %lld bytes\n",
 				  inode->i_ino, inode->i_size);
-			mutex_lock(&inode->i_mutex);
 			ext4_truncate(inode);
-			mutex_unlock(&inode->i_mutex);
 			nr_truncates++;
 		} else {
 			ext4_msg(sb, KERN_DEBUG,
@@ -3622,8 +3621,7 @@ no_journal:
 		goto failed_mount4;
 	}
 
-	if (ext4_setup_super(sb, es, sb->s_flags & MS_RDONLY))
-		sb->s_flags |= MS_RDONLY;
+	ext4_setup_super(sb, es, sb->s_flags & MS_RDONLY);
 
 	/* determine the minimum size of new large inodes, if present */
 	if (sbi->s_inode_size > EXT4_GOOD_OLD_INODE_SIZE) {
@@ -3681,19 +3679,22 @@ no_journal:
 	if (err) {
 		ext4_msg(sb, KERN_ERR, "failed to initialize mballoc (%d)",
 			 err);
-		goto failed_mount5;
+		goto failed_mount4;
 	}
 
 	err = ext4_register_li_request(sb, first_not_zeroed);
 	if (err)
-		goto failed_mount6;
+		goto failed_mount4;
 
 	sbi->s_kobj.kset = ext4_kset;
 	init_completion(&sbi->s_kobj_unregister);
 	err = kobject_init_and_add(&sbi->s_kobj, &ext4_ktype, NULL,
 				   "%s", sb->s_id);
-	if (err)
-		goto failed_mount7;
+	if (err) {
+		ext4_mb_release(sb);
+		ext4_ext_release(sb);
+		goto failed_mount4;
+	};
 
 	EXT4_SB(sb)->s_mount_state |= EXT4_ORPHAN_FS;
 	ext4_orphan_cleanup(sb, es);
@@ -3723,31 +3724,17 @@ no_journal:
 	return 0;
 
 cantfind_ext4:
-
-	/* for debugging, sangwoo2.lee */
-	/* If you wanna use the flag 'MS_SILENT', call 'print_bh' function within below 'if'. */
-	printk("printing data of superblock-bh\n");
-	print_bh(sb, bh, 0, EXT4_BLOCK_SIZE(sb));
-	/* for debugging */
-
 	if (!silent)
 		ext4_msg(sb, KERN_ERR, "VFS: Can't find ext4 filesystem");
-
 	goto failed_mount;
 
-failed_mount7:
-	ext4_unregister_li_request(sb);
-failed_mount6:
-	ext4_ext_release(sb);
-failed_mount5:
-	ext4_mb_release(sb);
-	ext4_release_system_zone(sb);
 failed_mount4:
 	iput(root);
 	sb->s_root = NULL;
 	ext4_msg(sb, KERN_ERR, "mount failed");
 	destroy_workqueue(EXT4_SB(sb)->dio_unwritten_wq);
 failed_mount_wq:
+	ext4_release_system_zone(sb);
 	if (sbi->s_journal) {
 		jbd2_journal_destroy(sbi->s_journal);
 		sbi->s_journal = NULL;
@@ -4451,7 +4438,7 @@ static int ext4_remount(struct super_block *sb, int *flags, char *data)
 	}
 
 	ext4_setup_system_zone(sb);
-	if (sbi->s_journal == NULL && !(old_sb_flags & MS_RDONLY))
+	if (sbi->s_journal == NULL)
 		ext4_commit_super(sb, 1);
 
 #ifdef CONFIG_QUOTA
@@ -4836,55 +4823,6 @@ out:
 }
 
 #endif
-
-/* for debugging, sangwoo2.lee */
-void print_bh(struct super_block *sb, struct buffer_head *bh, int start, int len)
-{
-	print_block_data(sb, bh->b_blocknr, bh->b_data, start, len);
-}
-
-void print_block_data(struct super_block *sb, sector_t blocknr, unsigned char *data_to_dump, int start, int len)
-{
-	int i, j;
-	int bh_offset = (start / 16) * 16;
-	char row_data[17] = { 0, };
-	char row_hex[50] = { 0, };
-	char ch;
-
-	printk(KERN_ERR "As EXT4-fs error, printing data in hex\n");
-	printk(KERN_ERR " [partition info] s_id : %s, start block# : %llu\n", sb->s_id, sb->s_bdev->bd_part->start_sect);
-	printk(KERN_ERR " dump block# : %llu, start offset(byte) : %d, length(byte) : %d\n", blocknr, start, len);
-	printk(KERN_ERR "-----------------------------------------------------------------------------\n");
-
-	for (i = 0; i < (len + 15) / 16; i++)
-	{
-		for (j = 0; j < 16; j++)
-		{
-			ch = *(data_to_dump + bh_offset + j);
-			if (start <= bh_offset + j && start + len > bh_offset + j)
-			{
-				if (isascii(ch) && isprint(ch))
-					sprintf(row_data + j, "%c", ch);
-				else
-					sprintf(row_data + j, ".");
-
-				sprintf(row_hex + (j * 3), "%2.2x ", ch);
-			}
-			else
-			{
-				sprintf(row_data + j, " ");
-				sprintf(row_hex + (j * 3), "-- ");
-			}
-		}
-
-		printk(KERN_ERR "0x%4.4x : %s | %s\n", bh_offset, row_hex, row_data);
-		bh_offset += 16;
-
-	}
-	printk(KERN_ERR "-----------------------------------------------------------------------------\n");
-}
-/* for debugging */
-
 
 static struct dentry *ext4_mount(struct file_system_type *fs_type, int flags,
 		       const char *dev_name, void *data)

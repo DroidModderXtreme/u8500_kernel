@@ -97,6 +97,7 @@ static int bdi_debug_stats_show(struct seq_file *m, void *v)
 		   "BdiDirtyThresh:   %8lu kB\n"
 		   "DirtyThresh:      %8lu kB\n"
 		   "BackgroundThresh: %8lu kB\n"
+		   "BdiWritten:       %8lu kB\n"
 		   "b_dirty:          %8lu\n"
 		   "b_io:             %8lu\n"
 		   "b_more_io:        %8lu\n"
@@ -104,8 +105,13 @@ static int bdi_debug_stats_show(struct seq_file *m, void *v)
 		   "state:            %8lx\n",
 		   (unsigned long) K(bdi_stat(bdi, BDI_WRITEBACK)),
 		   (unsigned long) K(bdi_stat(bdi, BDI_RECLAIMABLE)),
-		   K(bdi_thresh), K(dirty_thresh),
-		   K(background_thresh), nr_dirty, nr_io, nr_more_io,
+		   K(bdi_thresh),
+		   K(dirty_thresh),
+		   K(background_thresh),
+		   (unsigned long) K(bdi_stat(bdi, BDI_WRITTEN)),
+		   nr_dirty,
+		   nr_io,
+		   nr_more_io,
 		   !list_empty(&bdi->bdi_list), bdi->state);
 #undef K
 
@@ -258,18 +264,6 @@ subsys_initcall(default_bdi_init);
 int bdi_has_dirty_io(struct backing_dev_info *bdi)
 {
 	return wb_has_dirty_io(&bdi->wb);
-}
-
-static void bdi_flush_io(struct backing_dev_info *bdi)
-{
-	struct writeback_control wbc = {
-		.sync_mode		= WB_SYNC_NONE,
-		.older_than_this	= NULL,
-		.range_cyclic		= 1,
-		.nr_to_write		= 1024,
-	};
-
-	writeback_inodes_wb(&bdi->wb, &wbc);
 }
 
 /*
@@ -457,9 +451,10 @@ static int bdi_forker_thread(void *ptr)
 			if (IS_ERR(task)) {
 				/*
 				 * If thread creation fails, force writeout of
-				 * the bdi from the thread.
+				 * the bdi from the thread. Hopefully 1024 is
+				 * large enough for efficient IO.
 				 */
-				bdi_flush_io(bdi);
+				writeback_inodes_wb(&bdi->wb, 1024);
 			} else {
 				/*
 				 * The spinlock makes sure we do not lose
@@ -617,7 +612,6 @@ static void bdi_prune_sb(struct backing_dev_info *bdi)
 void bdi_unregister(struct backing_dev_info *bdi)
 {
 	if (bdi->dev) {
-		bdi_set_min_ratio(bdi, 0);
 		trace_writeback_bdi_unregister(bdi);
 		bdi_prune_sb(bdi);
 		del_timer_sync(&bdi->wb.wakeup_timer);
@@ -710,14 +704,6 @@ void bdi_destroy(struct backing_dev_info *bdi)
 	}
 
 	bdi_unregister(bdi);
-
-	/*
-	 * If bdi_unregister() had already been called earlier, the
-	 * wakeup_timer could still be armed because bdi_prune_sb()
-	 * can race with the bdi_wakeup_thread_delayed() calls from
-	 * __mark_inode_dirty().
-	 */
-	del_timer_sync(&bdi->wb.wakeup_timer);
 
 	for (i = 0; i < NR_BDI_STAT_ITEMS; i++)
 		percpu_counter_destroy(&bdi->bdi_stat[i]);
