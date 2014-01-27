@@ -146,9 +146,13 @@ struct usb_ep {
 	const char		*name;
 	const struct usb_ep_ops	*ops;
 	struct list_head	ep_list;
+	unsigned		max_streams:16;
 	unsigned		mult:2;
 	unsigned		maxburst:4;
+	u8			address;
 	unsigned		maxpacket:16;
+	const struct usb_endpoint_descriptor	*desc;
+	const struct usb_ss_ep_comp_descriptor	*comp_desc;
 };
 
 /*-------------------------------------------------------------------------*/

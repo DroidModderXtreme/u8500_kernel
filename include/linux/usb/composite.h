@@ -300,6 +300,7 @@ struct usb_composite_driver {
 	const char				*iManufacturer;
 	const struct usb_device_descriptor	*dev;
 	struct usb_gadget_strings		**strings;
+	enum usb_device_speed			max_speed;
 	unsigned		needs_serial:1;
 
 	int			(*unbind)(struct usb_composite_dev *);
