@@ -1193,7 +1193,6 @@ static int __check_block_validity(struct inode *inode, const char *func,
 				   map->m_len)) {
 		/* for debugging, sangwoo2.lee */
 		printk(KERN_ERR "printing inode..\n");
-		print_block_data(inode->i_sb, 0, (unsigned char *)inode, 0, EXT4_INODE_SIZE(inode->i_sb));
 		/* for debugging */
 
 		ext4_error_inode(inode, func, line, map->m_pblk,
@@ -5109,7 +5108,6 @@ bad_inode:
 	printk(KERN_ERR "sb info, inodes per group : %lu,"
 			, EXT4_SB(sb)->s_inodes_per_group);
 	printk(KERN_ERR " inode size : %d\n", EXT4_SB(sb)->s_inode_size);
-	print_bh(sb, iloc.bh, 0, EXT4_BLOCK_SIZE(sb));
 	/* for debugging, end */
 	brelse(iloc.bh);
 	iget_failed(inode);

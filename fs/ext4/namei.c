@@ -1031,7 +1031,6 @@ static struct dentry *ext4_lookup(struct inode *dir, struct dentry *dentry, stru
 		if (!ext4_valid_inum(dir->i_sb, ino)) {
                         /* for debugging, sangwoo2.lee */
                         printk(KERN_ERR "Name of directory entry has bad inode# : %s\n", de->name);
-                        print_bh(dir->i_sb, bh, 0, EXT4_BLOCK_SIZE(dir->i_sb));
                         /* for debugging */
                         brelse(bh);
 
