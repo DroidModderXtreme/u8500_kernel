@@ -1781,16 +1781,6 @@ static struct dst_entry *ipv4_dst_check(struct dst_entry *dst, u32 cookie)
 	}
 }
 
-static struct dst_entry *ipv4_dst_check(struct dst_entry *dst, u32 cookie)
-{
-	struct rtable *rt = (struct rtable *) dst;
-
-	if (rt_is_expired(rt))
-		return NULL;
-	ipv4_validate_peer(rt);
-	return dst;
-}
-
 static void ipv4_dst_destroy(struct dst_entry *dst)
 {
 	struct rtable *rt = (struct rtable *) dst;
@@ -2437,7 +2427,6 @@ int ip_route_input_common(struct sk_buff *skb, __be32 daddr, __be32 saddr,
 		    rth->rt_mark == skb->mark &&
 		    net_eq(dev_net(rth->dst.dev), net) &&
 		    !rt_is_expired(rth)) {
-			ipv4_validate_peer(rth);
 			if (noref) {
 				dst_use_noref(&rth->dst, jiffies);
 				skb_dst_set_noref(skb, &rth->dst);
@@ -2813,7 +2802,6 @@ struct rtable *__ip_route_output_key(struct net *net, struct flowi4 *flp4)
 			    (IPTOS_RT_MASK | RTO_ONLINK)) &&
 		    net_eq(dev_net(rth->dst.dev), net) &&
 		    !rt_is_expired(rth)) {
-			ipv4_validate_peer(rth);
 			dst_use(&rth->dst, jiffies);
 			RT_CACHE_STAT_INC(out_hit);
 			rcu_read_unlock_bh();
