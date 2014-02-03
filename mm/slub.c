@@ -2020,6 +2020,11 @@ static void *__slab_alloc(struct kmem_cache *s, gfp_t gfpflags, int node,
 	if (object)
 		goto update_freelist;
 
+	/* must check again c->freelist in case of cpu migration or IRQ */
+	object = c->freelist;
+	if (object)
+		goto load_freelist;
+
 	stat(s, ALLOC_SLOWPATH);
 
 	do {
