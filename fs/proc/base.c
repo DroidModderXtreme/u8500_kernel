@@ -133,12 +133,6 @@ struct pid_entry {
 		NULL, &proc_single_file_operations,	\
 		{ .proc_show = show } )
 
-/* ANDROID is for special files in /proc. */
-#define ANDROID(NAME, MODE, OTYPE)			\
-	NOD(NAME, (S_IFREG|(MODE)),			\
-		&proc_##OTYPE##_inode_operations,	\
-		&proc_##OTYPE##_operations, {})
-
 /*
  * Count the number of hardlinks for the pid_entry table, excluding the .
  * and .. links.
@@ -222,7 +216,7 @@ static struct mm_struct *__check_mem_permission(struct task_struct *task)
 	if (task_is_stopped_or_traced(task)) {
 		int match;
 		rcu_read_lock();
-		match = (tracehook_tracer_task(task) == current);
+		match = (ptrace_parent(task) == current);
 		rcu_read_unlock();
 		if (match && ptrace_may_access(task, PTRACE_MODE_ATTACH))
 			return mm;
@@ -680,7 +674,7 @@ static int mounts_open_common(struct inode *inode, struct file *file,
 	p->m.private = p;
 	p->ns = ns;
 	p->root = root;
-	p->event = ns->event;
+	p->m.poll_event = ns->event;
 
 	return 0;
 
@@ -891,10 +885,6 @@ out_no_task:
 	return ret;
 }
 
-#define mem_write NULL
-
-#ifndef mem_write
-/* This is a security hazard */
 static ssize_t mem_write(struct file * file, const char __user *buf,
 			 size_t count, loff_t *ppos)
 {
@@ -953,7 +943,6 @@ out_task:
 out_no_task:
 	return copied;
 }
-#endif
 
 loff_t mem_lseek(struct file *file, loff_t offset, int orig)
 {
@@ -1130,10 +1119,9 @@ static ssize_t oom_adjust_write(struct file *file, const char __user *buf,
 	 * Warn that /proc/pid/oom_adj is deprecated, see
 	 * Documentation/feature-removal-schedule.txt.
 	 */
-	printk_once(KERN_WARNING "%s (%d): /proc/%d/oom_adj is deprecated, "
-			"please use /proc/%d/oom_score_adj instead.\n",
-			current->comm, task_pid_nr(current),
-			task_pid_nr(task), task_pid_nr(task));
+	printk_once(KERN_WARNING "%s (%d): /proc/%d/oom_adj is deprecated, please use /proc/%d/oom_score_adj instead.\n",
+		  current->comm, task_pid_nr(current), task_pid_nr(task),
+		  task_pid_nr(task));
 	task->signal->oom_adj = oom_adjust;
 	/*
 	 * Scale /proc/pid/oom_score_adj appropriately ensuring that a maximum
@@ -1152,39 +1140,6 @@ err_task_lock:
 out:
 	return err < 0 ? err : count;
 }
-
-static int oom_adjust_permission(struct inode *inode, int mask,
-				 unsigned int flags)
-{
-	uid_t uid;
-	struct task_struct *p;
-
-	if (flags & IPERM_FLAG_RCU)
-		return -ECHILD;
-
-	p = get_proc_task(inode);
-	if(p) {
-		uid = task_uid(p);
-		put_task_struct(p);
-	}
-
-	/*
-	 * System Server (uid == 1000) is granted access to oom_adj of all 
-	 * android applications (uid > 10000) as and services (uid >= 1000)
-	 */
-	if (p && (current_fsuid() == 1000) && (uid >= 1000)) {
-		if (inode->i_mode >> 6 & mask) {
-			return 0;
-		}
-	}
-
-	/* Fall back to default. */
-	return generic_permission(inode, mask, flags, NULL);
-}
-
-static const struct inode_operations proc_oom_adjust_inode_operations = {
-	.permission	= oom_adjust_permission,
-};
 
 static const struct file_operations proc_oom_adjust_operations = {
 	.read		= oom_adjust_read,
@@ -1965,6 +1920,14 @@ static int proc_fd_info(struct inode *inode, struct path *path, char *info)
 		spin_lock(&files->file_lock);
 		file = fcheck_files(files, fd);
 		if (file) {
+			unsigned int f_flags;
+			struct fdtable *fdt;
+
+			fdt = files_fdtable(files);
+			f_flags = file->f_flags & ~O_CLOEXEC;
+			if (FD_ISSET(fd, fdt->close_on_exec))
+				f_flags |= O_CLOEXEC;
+
 			if (path) {
 				*path = file->f_path;
 				path_get(&file->f_path);
@@ -1974,7 +1937,7 @@ static int proc_fd_info(struct inode *inode, struct path *path, char *info)
 					 "pos:\t%lli\n"
 					 "flags:\t0%o\n",
 					 (long long) file->f_pos,
-					 file->f_flags);
+					 f_flags);
 			spin_unlock(&files->file_lock);
 			put_files_struct(files);
 			return 0;
@@ -2212,9 +2175,9 @@ static const struct file_operations proc_fd_operations = {
  * /proc/pid/fd needs a special permission handler so that a process can still
  * access /proc/self/fd after it has executed a setuid().
  */
-static int proc_fd_permission(struct inode *inode, int mask, unsigned int flags)
+static int proc_fd_permission(struct inode *inode, int mask)
 {
-	int rv = generic_permission(inode, mask, flags, NULL);
+	int rv = generic_permission(inode, mask);
 	if (rv == 0)
 		return 0;
 	if (task_pid(current) == proc_pid(inode))
@@ -2884,7 +2847,7 @@ static const struct pid_entry tgid_base_stuff[] = {
 	REG("cgroup",  S_IRUGO, proc_cgroup_operations),
 #endif
 	INF("oom_score",  S_IRUGO, proc_oom_score),
-	ANDROID("oom_adj",S_IRUGO|S_IWUSR, oom_adjust),
+	REG("oom_adj",    S_IRUGO|S_IWUSR, proc_oom_adjust_operations),
 	REG("oom_score_adj", S_IRUGO|S_IWUSR, proc_oom_score_adj_operations),
 #ifdef CONFIG_AUDITSYSCALL
 	REG("loginuid",   S_IWUSR|S_IRUGO, proc_loginuid_operations),

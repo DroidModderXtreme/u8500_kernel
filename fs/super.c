@@ -32,7 +32,6 @@
 #include <linux/backing-dev.h>
 #include <linux/rculist_bl.h>
 #include <linux/cleancache.h>
-#include <linux/grab_super.h>
 #include "internal.h"
 
 
@@ -62,7 +61,7 @@ static int prune_super(struct shrinker *shrink, struct shrink_control *sc)
 		return -1;
 
 	if (!grab_super_passive(sb))
-		return !sc->nr_to_scan ? 0 : -1;
+		return -1;
 
 	if (sb->s_op && sb->s_op->nr_cached_objects)
 		fs_objects = sb->s_op->nr_cached_objects(sb);
@@ -296,19 +295,19 @@ EXPORT_SYMBOL(deactivate_super);
  *	and want to turn it into a full-blown active reference.  grab_super()
  *	is called with sb_lock held and drops it.  Returns 1 in case of
  *	success, 0 if we had failed (superblock contents was already dead or
- *	dying when grab_super() had been called).  Note that this is only
- *	called for superblocks not in rundown mode (== ones still on ->fs_supers
- *	of their type), so increment of ->s_count is OK here.
+ *	dying when grab_super() had been called).
  */
 static int grab_super(struct super_block *s) __releases(sb_lock)
 {
-	s->s_count++;
-	spin_unlock(&sb_lock);
-	down_write(&s->s_umount);
-	if ((s->s_flags & MS_BORN) && atomic_inc_not_zero(&s->s_active)) {
-		put_super(s);
+	if (atomic_inc_not_zero(&s->s_active)) {
+		spin_unlock(&sb_lock);
 		return 1;
 	}
+	/* it's going away */
+	s->s_count++;
+	spin_unlock(&sb_lock);
+	/* wait for it to die */
+	down_write(&s->s_umount);
 	up_write(&s->s_umount);
 	put_super(s);
 	return 0;
@@ -352,13 +351,11 @@ bool grab_super_passive(struct super_block *sb)
  */
 void lock_super(struct super_block * sb)
 {
-	get_fs_excl();
 	mutex_lock(&sb->s_lock);
 }
 
 void unlock_super(struct super_block * sb)
 {
-	put_fs_excl();
 	mutex_unlock(&sb->s_lock);
 }
 
@@ -386,7 +383,6 @@ void generic_shutdown_super(struct super_block *sb)
 	if (sb->s_root) {
 		shrink_dcache_for_umount(sb);
 		sync_filesystem(sb);
-		get_fs_excl();
 		sb->s_flags &= ~MS_ACTIVE;
 
 		fsnotify_unmount_inodes(&sb->s_inodes);
@@ -401,7 +397,6 @@ void generic_shutdown_super(struct super_block *sb)
 			   "Self-destruct in 5 seconds.  Have a nice day...\n",
 			   sb->s_id);
 		}
-		put_fs_excl();
 	}
 	spin_lock(&sb_lock);
 	/* should be initialized for __put_super_and_need_restart() */
@@ -440,6 +435,11 @@ retry:
 				up_write(&s->s_umount);
 				destroy_super(s);
 				s = NULL;
+			}
+			down_write(&old->s_umount);
+			if (unlikely(!(old->s_flags & MS_BORN))) {
+				deactivate_locked_super(old);
+				goto retry;
 			}
 			return old;
 		}
@@ -554,6 +554,42 @@ void iterate_supers(void (*f)(struct super_block *, void *), void *arg)
 }
 
 /**
+ *	iterate_supers_type - call function for superblocks of given type
+ *	@type: fs type
+ *	@f: function to call
+ *	@arg: argument to pass to it
+ *
+ *	Scans the superblock list and calls given function, passing it
+ *	locked superblock and given argument.
+ */
+void iterate_supers_type(struct file_system_type *type,
+	void (*f)(struct super_block *, void *), void *arg)
+{
+	struct super_block *sb, *p = NULL;
+
+	spin_lock(&sb_lock);
+	list_for_each_entry(sb, &type->fs_supers, s_instances) {
+		sb->s_count++;
+		spin_unlock(&sb_lock);
+
+		down_read(&sb->s_umount);
+		if (sb->s_root)
+			f(sb, arg);
+		up_read(&sb->s_umount);
+
+		spin_lock(&sb_lock);
+		if (p)
+			__put_super(p);
+		p = sb;
+	}
+	if (p)
+		__put_super(p);
+	spin_unlock(&sb_lock);
+}
+
+EXPORT_SYMBOL(iterate_supers_type);
+
+/**
  *	get_super - get the superblock of a device
  *	@bdev: device to get the superblock for
  *	
@@ -614,10 +650,10 @@ restart:
 		if (list_empty(&sb->s_instances))
 			continue;
 		if (sb->s_bdev == bdev) {
-			if (!grab_super(sb))
+			if (grab_super(sb)) /* drops sb_lock */
+				return sb;
+			else
 				goto restart;
-			up_write(&sb->s_umount);
-			return sb;
 		}
 	}
 	spin_unlock(&sb_lock);
@@ -721,14 +757,10 @@ static void do_emergency_remount(struct work_struct *work)
 		spin_unlock(&sb_lock);
 		down_write(&sb->s_umount);
 		if (sb->s_root && sb->s_bdev && !(sb->s_flags & MS_RDONLY)) {
-			/* u8500: param.ko needs to update params.blk before rebooting */
-                        if (strcmp(sb->s_id, "mmcblk0p1") !=0)
-                        /*
+			/*
 			 * What lock protects sb->s_flags??
 			 */
 			do_remount_sb(sb, MS_RDONLY, NULL, 1);
-                    else
-                         printk("Skipping read-only remount of mmcblk0p1\n");
 		}
 		up_write(&sb->s_umount);
 		spin_lock(&sb_lock);
@@ -763,7 +795,7 @@ static DEFINE_IDA(unnamed_dev_ida);
 static DEFINE_SPINLOCK(unnamed_dev_lock);/* protects the above */
 static int unnamed_dev_start = 0; /* don't bother trying below it */
 
-int set_anon_super(struct super_block *s, void *data)
+int get_anon_bdev(dev_t *p)
 {
 	int dev;
 	int error;
@@ -790,23 +822,37 @@ int set_anon_super(struct super_block *s, void *data)
 		spin_unlock(&unnamed_dev_lock);
 		return -EMFILE;
 	}
-	s->s_dev = MKDEV(0, dev & MINORMASK);
-	s->s_bdi = &noop_backing_dev_info;
+	*p = MKDEV(0, dev & MINORMASK);
 	return 0;
+}
+EXPORT_SYMBOL(get_anon_bdev);
+
+void free_anon_bdev(dev_t dev)
+{
+	int slot = MINOR(dev);
+	spin_lock(&unnamed_dev_lock);
+	ida_remove(&unnamed_dev_ida, slot);
+	if (slot < unnamed_dev_start)
+		unnamed_dev_start = slot;
+	spin_unlock(&unnamed_dev_lock);
+}
+EXPORT_SYMBOL(free_anon_bdev);
+
+int set_anon_super(struct super_block *s, void *data)
+{
+	int error = get_anon_bdev(&s->s_dev);
+	if (!error)
+		s->s_bdi = &noop_backing_dev_info;
+	return error;
 }
 
 EXPORT_SYMBOL(set_anon_super);
 
 void kill_anon_super(struct super_block *sb)
 {
-	int slot = MINOR(sb->s_dev);
-
+	dev_t dev = sb->s_dev;
 	generic_shutdown_super(sb);
-	spin_lock(&unnamed_dev_lock);
-	ida_remove(&unnamed_dev_ida, slot);
-	if (slot < unnamed_dev_start)
-		unnamed_dev_start = slot;
-	spin_unlock(&unnamed_dev_lock);
+	free_anon_bdev(dev);
 }
 
 EXPORT_SYMBOL(kill_anon_super);
@@ -1115,8 +1161,6 @@ int freeze_super(struct super_block *sb)
 			printk(KERN_ERR
 				"VFS:Filesystem freeze failed\n");
 			sb->s_frozen = SB_UNFROZEN;
-			smp_wmb();
-			wake_up(&sb->s_wait_unfrozen);
 			deactivate_locked_super(sb);
 			return ret;
 		}

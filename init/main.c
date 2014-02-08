@@ -68,9 +68,7 @@
 #include <linux/shmem_fs.h>
 #include <linux/slab.h>
 #include <linux/perf_event.h>
-#include <linux/random.h>
 #include <linux/boottime.h>
-#include <linux/pasr.h>
 
 #include <asm/io.h>
 #include <asm/bugs.h>
@@ -158,24 +156,6 @@ static const char *panic_later, *panic_param;
 
 extern const struct obs_kernel_param __setup_start[], __setup_end[];
 
-#ifdef CONFIG_SAMSUNG_LOG_BUF
-void __iomem * log_buf_base = NULL;
-EXPORT_SYMBOL(log_buf_base);
-
-#include <mach/board-sec-ux500.h>
-extern void* log_buf_irq;
-extern int log_buf_irq_entry_size;
-extern int log_buf_irq_entry_count;
-extern void* log_buf_sched;
-extern int log_buf_sched_entry_size;
-extern int log_buf_sched_entry_count;
-extern void* log_buf_prcmu;
-extern int log_buf_prcmu_entry_size;
-extern int log_buf_prcmu_entry_count;
-
-unsigned int * log_buf_writel = NULL;
-EXPORT_SYMBOL(log_buf_writel);
-#endif
 static int __init obsolete_checksetup(char *line)
 {
 	const struct obs_kernel_param *p;
@@ -230,8 +210,19 @@ early_param("quiet", quiet_kernel);
 
 static int __init loglevel(char *str)
 {
-	get_option(&str, &console_loglevel);
-	return 0;
+	int newlevel;
+
+	/*
+	 * Only update loglevel value when a correct setting was passed,
+	 * to prevent blind crashes (when loglevel being set to 0) that
+	 * are quite hard to debug
+	 */
+	if (get_option(&str, &newlevel)) {
+		console_loglevel = newlevel;
+		return 0;
+	}
+
+	return -EINVAL;
 }
 
 early_param("loglevel", loglevel);
@@ -390,9 +381,9 @@ static noinline void __init_refok rest_init(void)
 	init_idle_bootup_task(current);
 	preempt_enable_no_resched();
 	schedule();
-	preempt_disable();
 
 	/* Call into cpu_idle with preempt disabled */
+	preempt_disable();
 	cpu_idle();
 }
 
@@ -507,9 +498,6 @@ asmlinkage void __init start_kernel(void)
 	page_address_init();
 	printk(KERN_NOTICE "%s", linux_banner);
 	setup_arch(&command_line);
-#ifdef CONFIG_PASR
-	early_pasr_setup();
-#endif
 	mm_init_owner(&init_mm, &init_task);
 	mm_init_cpumask(&init_mm);
 	setup_command_line(command_line);
@@ -573,11 +561,10 @@ asmlinkage void __init start_kernel(void)
 	early_boot_irqs_disabled = false;
 	local_irq_enable();
 
-	kmem_cache_init_late();
+	/* Interrupts are enabled now so all GFP allocations are safe. */
+	gfp_allowed_mask = __GFP_BITS_MASK;
 
-#ifdef CONFIG_PASR
-	late_pasr_setup();
-#endif
+	kmem_cache_init_late();
 
 	/*
 	 * HACK ALERT! This is early. We're enabling the console before
@@ -642,44 +629,6 @@ asmlinkage void __init start_kernel(void)
 	cpuset_init();
 	taskstats_init_early();
 	delayacct_init();
-
-#ifdef CONFIG_SAMSUNG_LOG_BUF
-	{
-		extern struct meminfo meminfo;
-		struct membank * bank =&meminfo.bank[meminfo.nr_banks-1];
-		log_buf_base = ioremap(bank->start + bank->size, 0x100000);
-		if(!log_buf_base)
-			printk(KERN_NOTICE "[LOG][ERROR] %s() log_buf_base = 0x%p\n", __FUNCTION__, log_buf_base);
-		else {
-			printk(KERN_NOTICE "[LOG] %s() log_buf_base = 0x%p, size=%ld\n", __FUNCTION__, 
-				(long unsigned int)log_buf_base, bank->size);
-
-			/* irq log buffer initialize */
-			if (LOG_IRQ_BUF_SIZE < (log_buf_irq_entry_size*(log_buf_irq_entry_count+2))) {
-				printk(KERN_NOTICE "LOG_IRQ_BUF_SIZE should be checked!!\n");
-			} else {
-				log_buf_irq = (void*)((unsigned long)log_buf_base + LOG_IRQ_BUF_START + log_buf_irq_entry_size);
-			}
-
-			/* scheduler log buffer initialize */
-			if (LOG_SCHED_BUF_SIZE < (log_buf_sched_entry_size*(log_buf_sched_entry_count+2))) {
-				printk(KERN_NOTICE "LOG_SCHED_BUF_SIZE should be checked!!\n");
-			} else {
-				log_buf_sched = (void*)((unsigned long)log_buf_base + LOG_SCHED_BUF_START + log_buf_sched_entry_size);
-			}
-
-			/* prcmu/shrm log buffer initialize */
-			if (LOG_SHRM_PRCMU_BUF_SIZE < (log_buf_prcmu_entry_size*(log_buf_prcmu_entry_count+2))) {
-				printk(KERN_NOTICE "LOG_SHRM_PRCMU_BUF_SIZE should be checked!!\n");
-			} else {
-				log_buf_prcmu = (void*)((unsigned long)log_buf_base + LOG_SHRM_PRCMU_BUF_START + log_buf_prcmu_entry_size);
-			}
-
-			/* writel log initialize */
-			log_buf_writel = (unsigned int*)((unsigned long)log_buf_base + 0x100000 - 4);
-		}
-	}
-#endif
 
 	check_bugs();
 
@@ -780,12 +729,12 @@ static void __init do_basic_setup(void)
 {
 	cpuset_init_smp();
 	usermodehelper_init();
-	init_tmpfs();
+	shmem_init();
 	driver_init();
 	init_irq_proc();
 	do_ctors();
+	usermodehelper_enable();
 	do_initcalls();
-	random_int_secret_init();
 }
 
 static void __init do_pre_smp_initcalls(void)
@@ -850,10 +799,6 @@ static int __init kernel_init(void * unused)
 	 * Wait until kthreadd is all set-up.
 	 */
 	wait_for_completion(&kthreadd_done);
-
-	/* Now the scheduler is fully set up and can do blocking allocations */
-	gfp_allowed_mask = __GFP_BITS_MASK;
-
 	/*
 	 * init can allocate pages on any node
 	 */

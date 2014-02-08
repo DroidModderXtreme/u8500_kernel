@@ -22,9 +22,7 @@
 #include <linux/mm.h>
 #include <linux/slab.h>
 #include <linux/suspend.h>
-#include <linux/kthread.h>
 #include <linux/syscore_ops.h>
-#include <linux/ftrace.h>
 #include <trace/events/power.h>
 
 #include "power.h"
@@ -39,10 +37,6 @@ const char *const pm_states[PM_SUSPEND_MAX] = {
 
 static const struct platform_suspend_ops *suspend_ops;
 
-static struct completion second_cpu_complete = {1,
-	__WAIT_QUEUE_HEAD_INITIALIZER((second_cpu_complete).wait)
-};
-
 /**
  *	suspend_set_ops - Set the global suspend method table.
  *	@ops:	Pointer to ops structure.
@@ -53,6 +47,7 @@ void suspend_set_ops(const struct platform_suspend_ops *ops)
 	suspend_ops = ops;
 	mutex_unlock(&pm_mutex);
 }
+EXPORT_SYMBOL_GPL(suspend_set_ops);
 
 bool valid_state(suspend_state_t state)
 {
@@ -74,6 +69,7 @@ int suspend_valid_only_mem(suspend_state_t state)
 {
 	return state == PM_SUSPEND_MEM;
 }
+EXPORT_SYMBOL_GPL(suspend_valid_only_mem);
 
 static int suspend_test(int level)
 {
@@ -135,12 +131,13 @@ void __attribute__ ((weak)) arch_suspend_enable_irqs(void)
 }
 
 /**
- *	suspend_enter - enter the desired system sleep state.
- *	@state:		state to enter
+ * suspend_enter - enter the desired system sleep state.
+ * @state: State to enter
+ * @wakeup: Returns information that suspend should not be entered again.
  *
- *	This function should be called after devices have been suspended.
+ * This function should be called after devices have been suspended.
  */
-static int suspend_enter(suspend_state_t state)
+static int suspend_enter(suspend_state_t state, bool *wakeup)
 {
 	int error;
 
@@ -165,17 +162,17 @@ static int suspend_enter(suspend_state_t state)
 	if (suspend_test(TEST_PLATFORM))
 		goto Platform_wake;
 
-
 	error = disable_nonboot_cpus();
 	if (error || suspend_test(TEST_CPUS))
-		goto Platform_wake;
+		goto Enable_cpus;
 
 	arch_suspend_disable_irqs();
 	BUG_ON(!irqs_disabled());
 
 	error = syscore_suspend();
 	if (!error) {
-		if (!(suspend_test(TEST_CORE) || pm_wakeup_pending())) {
+		*wakeup = pm_wakeup_pending();
+		if (!(suspend_test(TEST_CORE) || *wakeup)) {
 			error = suspend_ops->enter(state);
 			events_check_enabled = false;
 		}
@@ -184,6 +181,9 @@ static int suspend_enter(suspend_state_t state)
 
 	arch_suspend_enable_irqs();
 	BUG_ON(irqs_disabled());
+
+ Enable_cpus:
+	enable_nonboot_cpus();
 
  Platform_wake:
 	if (suspend_ops->wake)
@@ -206,6 +206,7 @@ static int suspend_enter(suspend_state_t state)
 int suspend_devices_and_enter(suspend_state_t state)
 {
 	int error;
+	bool wakeup = false;
 
 	if (!suspend_ops)
 		return -ENOSYS;
@@ -217,7 +218,6 @@ int suspend_devices_and_enter(suspend_state_t state)
 			goto Close;
 	}
 	suspend_console();
-	ftrace_stop();
 	suspend_test_start();
 	error = dpm_suspend_start(PMSG_SUSPEND);
 	if (error) {
@@ -228,13 +228,15 @@ int suspend_devices_and_enter(suspend_state_t state)
 	if (suspend_test(TEST_DEVICES))
 		goto Recover_platform;
 
-	error = suspend_enter(state);
+	do {
+		error = suspend_enter(state, &wakeup);
+	} while (!error && !wakeup
+		&& suspend_ops->suspend_again && suspend_ops->suspend_again());
 
  Resume_devices:
 	suspend_test_start();
 	dpm_resume_end(PMSG_RESUME);
 	suspend_test_finish("resume devices");
-	ftrace_start();
 	resume_console();
  Close:
 	if (suspend_ops->end)
@@ -262,18 +264,6 @@ static void suspend_finish(void)
 	pm_restore_console();
 }
 
-static int plug_secondary_cpus(void *data)
-{
-	if (!(suspend_test(TEST_FREEZER) ||
-	      suspend_test(TEST_DEVICES) ||
-	      suspend_test(TEST_PLATFORM)))
-		enable_nonboot_cpus();
-
-	complete(&second_cpu_complete);
-
-	return 0;
-}
-
 /**
  *	enter_state - Do common work of entering low-power state.
  *	@state:		pm_state structure for state we're entering.
@@ -287,21 +277,12 @@ static int plug_secondary_cpus(void *data)
 int enter_state(suspend_state_t state)
 {
 	int error;
-	struct task_struct *cpu_task;
 
 	if (!valid_state(state))
 		return -ENODEV;
 
 	if (!mutex_trylock(&pm_mutex))
 		return -EBUSY;
-
-	/*
-	 * Assure that previous started thread is completed before
-	 * attempting to suspend again.
-	 */
-	error = wait_for_completion_timeout(&second_cpu_complete,
-					    msecs_to_jiffies(500));
-	WARN_ON(error == 0);
 
 	printk(KERN_INFO "PM: Syncing filesystems ... ");
 	sys_sync();
@@ -324,11 +305,6 @@ int enter_state(suspend_state_t state)
 	pr_debug("PM: Finishing wakeup.\n");
 	suspend_finish();
  Unlock:
-
-	cpu_task = kthread_run(plug_secondary_cpus,
-			       NULL, "cpu-plug");
-	BUG_ON(IS_ERR(cpu_task));
-
 	mutex_unlock(&pm_mutex);
 	return error;
 }

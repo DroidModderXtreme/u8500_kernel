@@ -236,15 +236,6 @@ static int cs_dig_playback_pcm_cleanup(struct hda_pcm_stream *hinfo,
 	return snd_hda_multi_out_dig_cleanup(codec, &spec->multiout);
 }
 
-static void cs_update_input_select(struct hda_codec *codec)
-{
-	struct cs_spec *spec = codec->spec;
-	if (spec->cur_adc)
-		snd_hda_codec_write(codec, spec->cur_adc, 0,
-				    AC_VERB_SET_CONNECT_SEL,
-				    spec->adc_idx[spec->cur_input]);
-}
-
 /*
  * Analog capture
  */
@@ -258,7 +249,6 @@ static int cs_capture_pcm_prepare(struct hda_pcm_stream *hinfo,
 	spec->cur_adc = spec->adc_nid[spec->cur_input];
 	spec->cur_adc_stream_tag = stream_tag;
 	spec->cur_adc_format = format;
-	cs_update_input_select(codec);
 	snd_hda_codec_setup_stream(codec, spec->cur_adc, stream_tag, 0, format);
 	return 0;
 }
@@ -385,19 +375,21 @@ static int is_ext_mic(struct hda_codec *codec, unsigned int idx)
 static hda_nid_t get_adc(struct hda_codec *codec, hda_nid_t pin,
 			 unsigned int *idxp)
 {
-	int i;
+	int i, idx;
 	hda_nid_t nid;
 
 	nid = codec->start_nid;
 	for (i = 0; i < codec->num_nodes; i++, nid++) {
- 		unsigned int type;
- 		type = get_wcaps_type(get_wcaps(codec, nid));
- 		if (type != AC_WID_AUD_IN)
- 			continue;
-		*idxp = snd_hda_get_conn_index(codec, nid, pin, false);
-		if (*idxp >= 0)
- 			return nid;
- 	}
+		unsigned int type;
+		type = get_wcaps_type(get_wcaps(codec, nid));
+		if (type != AC_WID_AUD_IN)
+			continue;
+		idx = snd_hda_get_conn_index(codec, nid, pin, false);
+		if (idx >= 0) {
+			*idxp = idx;
+			return nid;
+		}
+	}
 	return 0;
 }
 
@@ -696,8 +688,10 @@ static int change_cur_input(struct hda_codec *codec, unsigned int idx,
 					   spec->cur_adc_stream_tag, 0,
 					   spec->cur_adc_format);
 	}
+	snd_hda_codec_write(codec, spec->cur_adc, 0,
+			    AC_VERB_SET_CONNECT_SEL,
+			    spec->adc_idx[idx]);
 	spec->cur_input = idx;
-	cs_update_input_select(codec);
 	return 1;
 }
 
@@ -854,7 +848,8 @@ static int build_digital_output(struct hda_codec *codec)
 	if (!spec->multiout.dig_out_nid)
 		return 0;
 
-	err = snd_hda_create_spdif_out_ctls(codec, spec->multiout.dig_out_nid);
+	err = snd_hda_create_spdif_out_ctls(codec, spec->multiout.dig_out_nid,
+					    spec->multiout.dig_out_nid);
 	if (err < 0)
 		return err;
 	err = snd_hda_create_spdif_share_sw(codec, &spec->multiout);
@@ -913,14 +908,16 @@ static void cs_automute(struct hda_codec *codec)
 
 	/* mute speakers if spdif or hp jack is plugged in */
 	for (i = 0; i < cfg->speaker_outs; i++) {
-		int pin_ctl = hp_present ? 0 : PIN_OUT;
-		/* detect on spdif is specific to CS421x */
-		if (spdif_present && (spec->vendor_nid == CS421X_VENDOR_NID))
-			pin_ctl = 0;
-
 		nid = cfg->speaker_pins[i];
 		snd_hda_codec_write(codec, nid, 0,
-				    AC_VERB_SET_PIN_WIDGET_CONTROL, pin_ctl);
+				    AC_VERB_SET_PIN_WIDGET_CONTROL,
+				    hp_present ? 0 : PIN_OUT);
+		/* detect on spdif is specific to CS421x */
+		if (spec->vendor_nid == CS421X_VENDOR_NID) {
+			snd_hda_codec_write(codec, nid, 0,
+					AC_VERB_SET_PIN_WIDGET_CONTROL,
+					spdif_present ? 0 : PIN_OUT);
+		}
 	}
 	if (spec->board_config == CS420X_MBP53 ||
 	    spec->board_config == CS420X_MBP55 ||
@@ -975,7 +972,10 @@ static void cs_automic(struct hda_codec *codec)
 		} else  {
 			spec->cur_input = spec->last_input;
 		}
-		cs_update_input_select(codec);
+
+		snd_hda_codec_write_cache(codec, spec->cur_adc, 0,
+					AC_VERB_SET_CONNECT_SEL,
+					spec->adc_idx[spec->cur_input]);
 	} else {
 		if (present)
 			change_cur_input(codec, spec->automic_idx, 0);
@@ -1072,7 +1072,9 @@ static void init_input(struct hda_codec *codec)
 			cs_automic(codec);
 		else  {
 			spec->cur_adc = spec->adc_nid[spec->cur_input];
-			cs_update_input_select(codec);
+			snd_hda_codec_write(codec, spec->cur_adc, 0,
+					AC_VERB_SET_CONNECT_SEL,
+					spec->adc_idx[spec->cur_input]);
 		}
 	} else {
 		change_cur_input(codec, spec->cur_input, 1);
@@ -1101,7 +1103,7 @@ static const struct hda_verb cs_coef_init_verbs[] = {
 	  | 0x0400 /* Disable Coefficient Auto increment */
 	  )},
 	/* Beep */
-	{0x11, AC_VERB_SET_COEF_INDEX, IDX_BEEP_CFG},
+	{0x11, AC_VERB_SET_COEF_INDEX, IDX_DAC_CFG},
 	{0x11, AC_VERB_SET_PROC_COEF, 0x0007}, /* Enable Beep thru DAC1/2/3 */
 
 	{} /* terminator */
@@ -1751,17 +1753,28 @@ static int build_cs421x_output(struct hda_codec *codec)
 	struct auto_pin_cfg *cfg = &spec->autocfg;
 	struct snd_kcontrol *kctl;
 	int err;
-	char *name = "Master";
+	char *name = "HP/Speakers";
 
 	fix_volume_caps(codec, dac);
+	if (!spec->vmaster_sw) {
+		err = add_vmaster(codec, dac);
+		if (err < 0)
+			return err;
+	}
 
 	err = add_mute(codec, name, 0,
 			HDA_COMPOSE_AMP_VAL(dac, 3, 0, HDA_OUTPUT), 0, &kctl);
 	if (err < 0)
 		return err;
+	err = snd_ctl_add_slave(spec->vmaster_sw, kctl);
+	if (err < 0)
+		return err;
 
 	err = add_volume(codec, name, 0,
 			HDA_COMPOSE_AMP_VAL(dac, 3, 0, HDA_OUTPUT), 0, &kctl);
+	if (err < 0)
+		return err;
+	err = snd_ctl_add_slave(spec->vmaster_vol, kctl);
 	if (err < 0)
 		return err;
 

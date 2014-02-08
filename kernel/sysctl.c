@@ -173,7 +173,7 @@ static int proc_taint(struct ctl_table *table, int write,
 #endif
 
 #ifdef CONFIG_PRINTK
-static int proc_dointvec_minmax_sysadmin(struct ctl_table *table, int write,
+static int proc_dmesg_restrict(struct ctl_table *table, int write,
 				void __user *buffer, size_t *lenp, loff_t *ppos);
 #endif
 
@@ -710,7 +710,7 @@ static struct ctl_table kern_table[] = {
 		.data		= &dmesg_restrict,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec_minmax_sysadmin,
+		.proc_handler	= proc_dointvec_minmax,
 		.extra1		= &zero,
 		.extra2		= &one,
 	},
@@ -719,7 +719,7 @@ static struct ctl_table kern_table[] = {
 		.data		= &kptr_restrict,
 		.maxlen		= sizeof(int),
 		.mode		= 0644,
-		.proc_handler	= proc_dointvec_minmax_sysadmin,
+		.proc_handler	= proc_dmesg_restrict,
 		.extra1		= &zero,
 		.extra2		= &two,
 	},
@@ -1518,20 +1518,7 @@ static struct ctl_table fs_table[] = {
 	{ }
 };
 
-#ifdef CONFIG_SAMSUNG_KERNEL_DEBUG
-int gDvm_addr = 0;
-#endif /* CONFIG_SAMSUNG_KERNEL_DEBUG */
-
 static struct ctl_table debug_table[] = {
-#ifdef CONFIG_SAMSUNG_KERNEL_DEBUG
-    {
-        .procname   = "gDvm_addr",
-        .data       = &gDvm_addr,
-        .maxlen     = sizeof(int),
-        .mode       = 0644,
-        .proc_handler   = &proc_dointvec,
-    },
-#endif /* CONFIG_SAMSUNG_KERNEL_DEBUG */
 #if defined(CONFIG_X86) || defined(CONFIG_PPC) || defined(CONFIG_SPARC) || \
     defined(CONFIG_S390) || defined(CONFIG_TILE)
 	{
@@ -1611,16 +1598,11 @@ void sysctl_head_get(struct ctl_table_header *head)
 	spin_unlock(&sysctl_lock);
 }
 
-static void free_head(struct rcu_head *rcu)
-{
-	kfree(container_of(rcu, struct ctl_table_header, rcu));
-}
-
 void sysctl_head_put(struct ctl_table_header *head)
 {
 	spin_lock(&sysctl_lock);
 	if (!--head->count)
-		call_rcu(&head->rcu, free_head);
+		kfree_rcu(head, rcu);
 	spin_unlock(&sysctl_lock);
 }
 
@@ -1992,10 +1974,10 @@ void unregister_sysctl_table(struct ctl_table_header * header)
 	start_unregistering(header);
 	if (!--header->parent->count) {
 		WARN_ON(1);
-		call_rcu(&header->parent->rcu, free_head);
+		kfree_rcu(header->parent, rcu);
 	}
 	if (!--header->count)
-		call_rcu(&header->rcu, free_head);
+		kfree_rcu(header, rcu);
 	spin_unlock(&sysctl_lock);
 }
 
@@ -2437,7 +2419,7 @@ static int proc_taint(struct ctl_table *table, int write,
 }
 
 #ifdef CONFIG_PRINTK
-static int proc_dointvec_minmax_sysadmin(struct ctl_table *table, int write,
+static int proc_dmesg_restrict(struct ctl_table *table, int write,
 				void __user *buffer, size_t *lenp, loff_t *ppos)
 {
 	if (write && !capable(CAP_SYS_ADMIN))

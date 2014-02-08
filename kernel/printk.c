@@ -44,10 +44,6 @@
 #include <trace/stm.h>
 
 #include <asm/uaccess.h>
-#ifdef	CONFIG_SAMSUNG_LOG_BUF
-#include <mach/board-sec-ux500.h>
-#endif
-
 
 /*
  * Architectures can override it:
@@ -58,7 +54,7 @@ void asmlinkage __attribute__((weak)) early_printk(const char *fmt, ...)
 
 #define __LOG_BUF_LEN	(1 << CONFIG_LOG_BUF_SHIFT)
 
-#ifdef        CONFIG_PRINTK_LL
+#ifdef        CONFIG_DEBUG_LL
 extern void printascii(char *);
 #endif
 
@@ -184,7 +180,6 @@ static unsigned long __initdata new_log_buf_len;
 static int __init log_buf_len_setup(char *str)
 {
 	unsigned size = memparse(str, &str);
-	unsigned long flags;
 
 	if (size)
 		size = roundup_pow_of_two(size);
@@ -245,7 +240,6 @@ void __init setup_log_buf(int early)
 	pr_info("log_buf_len: %d\n", log_buf_len);
 	pr_info("early log buf free: %d(%d%%)\n",
 		free, (free * 100) / __LOG_BUF_LEN);
-
 }
 
 #ifdef CONFIG_BOOT_PRINTK_DELAY
@@ -691,19 +685,8 @@ static void call_console_drivers(unsigned start, unsigned end)
 	start_print = start;
 	while (cur_index != end) {
 		if (msg_level < 0 && ((end - cur_index) > 2)) {
-			/*
-			 * prepare buf_prefix, as a contiguous array,
-			 * to be processed by log_prefix function
-			 */
-			char buf_prefix[SYSLOG_PRI_MAX_LENGTH+1];
-			unsigned i;
-			for (i = 0; i < ((end - cur_index)) && (i < SYSLOG_PRI_MAX_LENGTH); i++) {
-				buf_prefix[i] = LOG_BUF(cur_index + i);
-			}
-			buf_prefix[i] = '\0'; /* force '\0' as last string character */
-
 			/* strip log prefix */
-			cur_index += log_prefix((const char *)&buf_prefix, &msg_level, NULL);
+			cur_index += log_prefix(&LOG_BUF(cur_index), &msg_level, NULL);
 			start_print = cur_index;
 		}
 		while (cur_index != end) {
@@ -730,61 +713,6 @@ static void call_console_drivers(unsigned start, unsigned end)
 	_call_console_drivers(start_print, end, msg_level);
 }
 
-#ifdef CONFIG_SAMSUNG_LOG_BUF
-extern void __iomem * log_buf_base;
-static unsigned long * log_index;
-static int ioremapped = 0;
-static char *logging_buffer = NULL;
-static int b_first_call_after_booting = 0;
-unsigned long logging_mode = 3;// 0= nothing, 1=ram logging only, 2=serial only, 3=both
-
-#define LOGGING_INDEX_MASK	((1 << 20) - 1)	// 1111 1111 1111 1111 1111 = 0xfffff = 1,048,575 // 1M = 1,048,576
-#define LOGGING_BUF(idx) (logging_buffer[(idx) & LOGGING_INDEX_MASK])
-extern unsigned long logging_mode;
-
-unsigned long g_log_index = 0;
-int g_offset = 0;
-int g_chunk=0;
-int g_len=0;
-
-static void emit_log_char_RAMbuf(char* src, int len)
-{
-	int chunk=0;
-	int offset=0;
-	if((logging_mode & LOGGING_RAM_MASK) && (!ioremapped && log_buf_base  ))
-	{
-		logging_buffer = (char *)(log_buf_base+LOG_BUF_INDEX_SIZE);
-		log_index = (unsigned long *)(log_buf_base);
-
-		(*log_index) = 0;
-		ioremapped=1;
-	}
-
-	if((ioremapped) && (logging_mode & LOGGING_RAM_MASK))
-	{
-		do {
-			if((*log_index + len) > (LOGGING_RAMBUF_DATA_SIZE))
-				chunk = LOGGING_RAMBUF_DATA_SIZE - *log_index;
-			else
-				chunk = len;
-
-			g_log_index = (*log_index);
-			g_offset = offset;
-			g_chunk = chunk;
-			g_len = len;
-
-			memcpy((void *)&LOGGING_BUF((*log_index)),src+offset, chunk);
-			*log_index += chunk;
-			len -= chunk;
-			offset += chunk;
-
-			if((*log_index) >= LOGGING_RAMBUF_DATA_SIZE)
-				(*log_index)=0;
-		}while(len > 0);
-	}
-}
-
-#endif	//	CONFIG_SAMSUNG_LOG_BUF
 static void emit_log_char(char c)
 {
 	LOG_BUF(log_end) = c;
@@ -908,7 +836,7 @@ static inline int can_use_console(unsigned int cpu)
 static int console_trylock_for_printk(unsigned int cpu)
 	__releases(&logbuf_lock)
 {
-	int retval = 0;
+	int retval = 0, wake = 0;
 
 	if (console_trylock()) {
 		retval = 1;
@@ -921,12 +849,14 @@ static int console_trylock_for_printk(unsigned int cpu)
 		 */
 		if (!can_use_console(cpu)) {
 			console_locked = 0;
-			up(&console_sem);
+			wake = 1;
 			retval = 0;
 		}
 	}
 	printk_cpu = UINT_MAX;
 	spin_unlock(&logbuf_lock);
+	if (wake)
+		up(&console_sem);
 	return retval;
 }
 static const char recursion_bug_msg [] =
@@ -998,7 +928,7 @@ asmlinkage int vprintk(const char *fmt, va_list args)
 	printed_len += vscnprintf(printk_buf + printed_len,
 				  sizeof(printk_buf) - printed_len, fmt, args);
 
-#ifdef	CONFIG_PRINTK_LL
+#ifdef	CONFIG_DEBUG_LL
 	printascii(printk_buf);
 #endif
 
@@ -1046,24 +976,6 @@ asmlinkage int vprintk(const char *fmt, va_list args)
 				emit_log_char('<');
 				emit_log_char(current_log_level + '0');
 				emit_log_char('>');
-#ifdef CONFIG_SAMSUNG_LOG_BUF
-			{
-				char tbuf[3];
-
-				// check kernel start
-				if( (b_first_call_after_booting == 0) &&
-					(logging_mode & LOGGING_RAM_MASK) && 
-					(!ioremapped && log_buf_base  ) )
-				{
-					char tempChar[] = "============== start kernel logging !! ==============\n";
-					b_first_call_after_booting = 1;
-					emit_log_char_RAMbuf(tempChar, sizeof(tempChar));
-				}
-				
-				sprintf(tbuf, "<%1d>",default_message_loglevel);
-				emit_log_char_RAMbuf(tbuf, 3);
-			}
-#endif
 				printed_len += 3;
 			}
 
@@ -1082,9 +994,6 @@ asmlinkage int vprintk(const char *fmt, va_list args)
 
 				for (tp = tbuf; tp < tbuf + tlen; tp++)
 					emit_log_char(*tp);
-#ifdef CONFIG_SAMSUNG_LOG_BUF				
-				emit_log_char_RAMbuf(tbuf, tlen);
-#endif
 				printed_len += tlen;
 			}
 
@@ -1096,10 +1005,6 @@ asmlinkage int vprintk(const char *fmt, va_list args)
 		if (*p == '\n')
 			new_text_line = 1;
 	}
-
-#ifdef CONFIG_SAMSUNG_LOG_BUF
-	emit_log_char_RAMbuf(printk_buf, strlen(printk_buf));
-#endif
 
 	/*
 	 * Try to acquire and then immediately release the
@@ -1399,7 +1304,7 @@ void console_unlock(void)
 {
 	unsigned long flags;
 	unsigned _con_start, _log_end;
-	unsigned wake_klogd = 0;
+	unsigned wake_klogd = 0, retry = 0;
 
 	if (console_suspended) {
 		up(&console_sem);
@@ -1408,6 +1313,7 @@ void console_unlock(void)
 
 	console_may_schedule = 0;
 
+again:
 	for ( ; ; ) {
 		spin_lock_irqsave(&logbuf_lock, flags);
 		wake_klogd |= log_start - log_end;
@@ -1428,8 +1334,23 @@ void console_unlock(void)
 	if (unlikely(exclusive_console))
 		exclusive_console = NULL;
 
+	spin_unlock(&logbuf_lock);
+
 	up(&console_sem);
+
+	/*
+	 * Someone could have filled up the buffer again, so re-check if there's
+	 * something to flush. In case we cannot trylock the console_sem again,
+	 * there's a new owner and the console_unlock() from them will do the
+	 * flush, no worries.
+	 */
+	spin_lock(&logbuf_lock);
+	if (con_start != log_end)
+		retry = 1;
 	spin_unlock_irqrestore(&logbuf_lock, flags);
+	if (retry && console_trylock())
+		goto again;
+
 	if (wake_klogd)
 		wake_up_klogd();
 }

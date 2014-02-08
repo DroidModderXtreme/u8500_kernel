@@ -18,7 +18,6 @@ config SND_SOC_ALL_CODECS
 	select SND_SOC_AD1980 if SND_SOC_AC97_BUS
 	select SND_SOC_AD73311
 	select SND_SOC_ADAV80X
-	select SND_SOC_ADAU1701 if I2C
 	select SND_SOC_ADS117X
 	select SND_SOC_AK4104 if SPI_MASTER
 	select SND_SOC_AK4535 if I2C
@@ -79,7 +78,6 @@ config SND_SOC_ALL_CODECS
 	select SND_SOC_WM8900 if I2C
 	select SND_SOC_WM8903 if I2C
 	select SND_SOC_WM8904 if I2C
-	select SND_SOC_WM8915 if I2C
 	select SND_SOC_WM8940 if I2C
 	select SND_SOC_WM8955 if I2C
 	select SND_SOC_WM8960 if I2C
@@ -96,6 +94,7 @@ config SND_SOC_ALL_CODECS
 	select SND_SOC_WM8993 if I2C
 	select SND_SOC_WM8994 if MFD_WM8994
 	select SND_SOC_WM8995 if SND_SOC_I2C_AND_SPI
+	select SND_SOC_WM8996 if I2C
 	select SND_SOC_WM9081 if I2C
 	select SND_SOC_WM9090 if I2C
 	select SND_SOC_WM9705 if SND_SOC_AC97_BUS
@@ -256,10 +255,11 @@ config SND_SOC_TLV320DAC33
 	tristate
 
 config SND_SOC_TWL4030
-	select TWL4030_CODEC
+	select MFD_TWL4030_AUDIO
 	tristate
 
 config SND_SOC_TWL6040
+	select TWL6040_CORE
 	tristate
 
 config SND_SOC_UDA134X
@@ -334,9 +334,6 @@ config SND_SOC_WM8903
 config SND_SOC_WM8904
 	tristate
 
-config SND_SOC_WM8915
-	tristate
-
 config SND_SOC_WM8940
         tristate
 
@@ -383,6 +380,9 @@ config SND_SOC_WM8994
 	tristate
 
 config SND_SOC_WM8995
+	tristate
+
+config SND_SOC_WM8996
 	tristate
 
 config SND_SOC_WM9081

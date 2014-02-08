@@ -553,6 +553,19 @@ v9fs_inode_from_fid(struct v9fs_session_info *v9ses, struct p9_fid *fid,
 }
 
 /**
+ * v9fs_at_to_dotl_flags- convert Linux specific AT flags to
+ * plan 9 AT flag.
+ * @flags: flags to convert
+ */
+static int v9fs_at_to_dotl_flags(int flags)
+{
+	int rflags = 0;
+	if (flags & AT_REMOVEDIR)
+		rflags |= P9_DOTL_AT_REMOVEDIR;
+	return rflags;
+}
+
+/**
  * v9fs_remove - helper function to remove files and directories
  * @dir: directory inode that is being deleted
  * @dentry:  dentry that is being deleted
@@ -579,7 +592,8 @@ static int v9fs_remove(struct inode *dir, struct dentry *dentry, int flags)
 		return retval;
 	}
 	if (v9fs_proto_dotl(v9ses))
-		retval = p9_client_unlinkat(dfid, dentry->d_name.name, flags);
+		retval = p9_client_unlinkat(dfid, dentry->d_name.name,
+					    v9fs_at_to_dotl_flags(flags));
 	if (retval == -EOPNOTSUPP) {
 		/* Try the one based on path */
 		v9fid = v9fs_fid_clone(dentry);
@@ -706,8 +720,8 @@ v9fs_vfs_create(struct inode *dir, struct dentry *dentry, int mode,
 	fid = NULL;
 	v9ses = v9fs_inode2v9ses(dir);
 	perm = unixmode2p9mode(v9ses, mode);
-	if (nd && nd->flags & LOOKUP_OPEN)
-		flags = nd->intent.open.flags - 1;
+	if (nd)
+		flags = nd->intent.open.flags;
 	else
 		flags = O_RDWR;
 
@@ -722,7 +736,7 @@ v9fs_vfs_create(struct inode *dir, struct dentry *dentry, int mode,
 
 	v9fs_invalidate_inode_attr(dir);
 	/* if we are opening a file, assign the open fid to the file */
-	if (nd && nd->flags & LOOKUP_OPEN) {
+	if (nd) {
 		v9inode = V9FS_I(dentry->d_inode);
 		mutex_lock(&v9inode->v_mutex);
 		if (v9ses->cache && !v9inode->writeback_fid &&
@@ -979,11 +993,6 @@ clunk_newdir:
 				clear_nlink(new_inode);
 			else
 				drop_nlink(new_inode);
-			/*
-			 * Work around vfs rename rehash bug with
-			 * FS_RENAME_DOES_D_MOVE
-			 */
-			v9fs_invalidate_inode_attr(new_inode);
 		}
 		if (S_ISDIR(old_inode->i_mode)) {
 			if (!new_inode)

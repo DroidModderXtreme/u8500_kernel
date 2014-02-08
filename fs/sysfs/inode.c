@@ -136,13 +136,12 @@ static int sysfs_sd_setsecdata(struct sysfs_dirent *sd, void **secdata, u32 *sec
 	void *old_secdata;
 	size_t old_secdata_len;
 
-	if (!sd->s_iattr) {
-		sd->s_iattr = sysfs_init_inode_attrs(sd);
-		if (!sd->s_iattr)
-			return -ENOMEM;
-	}
-
 	iattrs = sd->s_iattr;
+	if (!iattrs)
+		iattrs = sysfs_init_inode_attrs(sd);
+	if (!iattrs)
+		return -ENOMEM;
+
 	old_secdata = iattrs->ia_secdata;
 	old_secdata_len = iattrs->ia_secdata_len;
 
@@ -350,11 +349,11 @@ int sysfs_hash_and_remove(struct sysfs_dirent *dir_sd, const void *ns, const cha
 		return -ENOENT;
 }
 
-int sysfs_permission(struct inode *inode, int mask, unsigned int flags)
+int sysfs_permission(struct inode *inode, int mask)
 {
 	struct sysfs_dirent *sd;
 
-	if (flags & IPERM_FLAG_RCU)
+	if (mask & MAY_NOT_BLOCK)
 		return -ECHILD;
 
 	sd = inode->i_private;
@@ -363,5 +362,5 @@ int sysfs_permission(struct inode *inode, int mask, unsigned int flags)
 	sysfs_refresh_inode(sd, inode);
 	mutex_unlock(&sysfs_mutex);
 
-	return generic_permission(inode, mask, flags, NULL);
+	return generic_permission(inode, mask);
 }

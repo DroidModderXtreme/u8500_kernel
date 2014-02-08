@@ -130,7 +130,7 @@ static int valid_ecryptfs_desc(const char *ecryptfs_desc)
 /*
  * valid_master_desc - verify the 'key-type:desc' of a new/updated master-key
  *
- * key-type:= "trusted:" | "encrypted:"
+ * key-type:= "trusted:" | "user:"
  * desc:= master-key description
  *
  * Verify that 'key-type' is valid and that 'desc' exists. On key update,
@@ -184,10 +184,12 @@ static int datablob_parse(char *datablob, const char **format,
 	int key_format;
 	char *p, *keyword;
 
-	p = strsep(&datablob, " \t");
-	if (!p)
+	keyword = strsep(&datablob, " \t");
+	if (!keyword) {
+		pr_info("encrypted_key: insufficient parameters specified\n");
 		return ret;
-	key_cmd = match_token(p, key_tokens, args);
+	}
+	key_cmd = match_token(keyword, key_tokens, args);
 
 	/* Get optional format: default | ecryptfs */
 	p = strsep(&datablob, " \t");
@@ -208,38 +210,59 @@ static int datablob_parse(char *datablob, const char **format,
 		break;
 	}
 
-	if (!*master_desc)
+	if (!*master_desc) {
+		pr_info("encrypted_key: master key parameter is missing\n");
 		goto out;
+	}
 
-	if (valid_master_desc(*master_desc, NULL) < 0)
+	if (valid_master_desc(*master_desc, NULL) < 0) {
+		pr_info("encrypted_key: master key parameter \'%s\' "
+			"is invalid\n", *master_desc);
 		goto out;
+	}
 
 	if (decrypted_datalen) {
 		*decrypted_datalen = strsep(&datablob, " \t");
-		if (!*decrypted_datalen)
+		if (!*decrypted_datalen) {
+			pr_info("encrypted_key: keylen parameter is missing\n");
 			goto out;
+		}
 	}
 
 	switch (key_cmd) {
 	case Opt_new:
-		if (!decrypted_datalen)
+		if (!decrypted_datalen) {
+			pr_info("encrypted_key: keyword \'%s\' not allowed "
+				"when called from .update method\n", keyword);
 			break;
+		}
 		ret = 0;
 		break;
 	case Opt_load:
-		if (!decrypted_datalen)
+		if (!decrypted_datalen) {
+			pr_info("encrypted_key: keyword \'%s\' not allowed "
+				"when called from .update method\n", keyword);
 			break;
+		}
 		*hex_encoded_iv = strsep(&datablob, " \t");
-		if (!*hex_encoded_iv)
+		if (!*hex_encoded_iv) {
+			pr_info("encrypted_key: hex blob is missing\n");
 			break;
+		}
 		ret = 0;
 		break;
 	case Opt_update:
-		if (decrypted_datalen)
+		if (decrypted_datalen) {
+			pr_info("encrypted_key: keyword \'%s\' not allowed "
+				"when called from .instantiate method\n",
+				keyword);
 			break;
+		}
 		ret = 0;
 		break;
 	case Opt_err:
+		pr_info("encrypted_key: keyword \'%s\' not recognized\n",
+			keyword);
 		break;
 	}
 out:
@@ -445,11 +468,13 @@ static struct key *request_master_key(struct encrypted_key_payload *epayload,
 	} else
 		goto out;
 
-	if (IS_ERR(mkey))
+	if (IS_ERR(mkey)) {
 		pr_info("encrypted_key: key %s not found",
 			epayload->master_desc);
-	if (mkey)
-		dump_master_key(*master_key, *master_keylen);
+		goto out;
+	}
+
+	dump_master_key(*master_key, *master_keylen);
 out:
 	return mkey;
 }

@@ -110,6 +110,35 @@ static struct file_system_type ext3_fs_type = {
 #define IS_EXT3_SB(sb) (0)
 #endif
 
+void *ext4_kvmalloc(size_t size, gfp_t flags)
+{
+	void *ret;
+
+	ret = kmalloc(size, flags);
+	if (!ret)
+		ret = __vmalloc(size, flags, PAGE_KERNEL);
+	return ret;
+}
+
+void *ext4_kvzalloc(size_t size, gfp_t flags)
+{
+	void *ret;
+
+	ret = kzalloc(size, flags);
+	if (!ret)
+		ret = __vmalloc(size, flags | __GFP_ZERO, PAGE_KERNEL);
+	return ret;
+}
+
+void ext4_kvfree(void *ptr)
+{
+	if (is_vmalloc_addr(ptr))
+		vfree(ptr);
+	else
+		kfree(ptr);
+
+}
+
 ext4_fsblk_t ext4_block_bitmap(struct super_block *sb,
 			       struct ext4_group_desc *bg)
 {
@@ -269,6 +298,7 @@ handle_t *ext4_journal_start_sb(struct super_block *sb, int nblocks)
 	journal_t *journal;
 	handle_t  *handle;
 
+	trace_ext4_journal_start(sb, nblocks, _RET_IP_);
 	if (sb->s_flags & MS_RDONLY)
 		return ERR_PTR(-EROFS);
 
@@ -789,11 +819,8 @@ static void ext4_put_super(struct super_block *sb)
 
 	for (i = 0; i < sbi->s_gdb_count; i++)
 		brelse(sbi->s_group_desc[i]);
-	kfree(sbi->s_group_desc);
-	if (is_vmalloc_addr(sbi->s_flex_groups))
-		vfree(sbi->s_flex_groups);
-	else
-		kfree(sbi->s_flex_groups);
+	ext4_kvfree(sbi->s_group_desc);
+	ext4_kvfree(sbi->s_flex_groups);
 	percpu_counter_destroy(&sbi->s_freeblocks_counter);
 	percpu_counter_destroy(&sbi->s_freeinodes_counter);
 	percpu_counter_destroy(&sbi->s_dirs_counter);
@@ -892,7 +919,6 @@ static void ext4_i_callback(struct rcu_head *head)
 
 static void ext4_destroy_inode(struct inode *inode)
 {
-	ext4_ioend_wait(inode);
 	if (!list_empty(&(EXT4_I(inode)->i_orphan))) {
 		ext4_msg(inode->i_sb, KERN_ERR,
 			 "Inode %lu (%p): orphan list check failed!",
@@ -1114,9 +1140,9 @@ static int ext4_show_options(struct seq_file *seq, struct vfsmount *vfs)
 		seq_puts(seq, ",block_validity");
 
 	if (!test_opt(sb, INIT_INODE_TABLE))
-		seq_puts(seq, ",noinit_itable");
+		seq_puts(seq, ",noinit_inode_table");
 	else if (sbi->s_li_wait_mult != EXT4_DEF_LI_WAIT_MULT)
-		seq_printf(seq, ",init_itable=%u",
+		seq_printf(seq, ",init_inode_table=%u",
 			   (unsigned) sbi->s_li_wait_mult);
 
 	ext4_show_quota_options(seq, sb);
@@ -1292,7 +1318,8 @@ enum {
 	Opt_nomblk_io_submit, Opt_block_validity, Opt_noblock_validity,
 	Opt_inode_readahead_blks, Opt_journal_ioprio,
 	Opt_dioread_nolock, Opt_dioread_lock,
-	Opt_discard, Opt_nodiscard, Opt_init_itable, Opt_noinit_itable,
+	Opt_discard, Opt_nodiscard,
+	Opt_init_inode_table, Opt_noinit_inode_table,
 };
 
 static const match_table_t tokens = {
@@ -1365,9 +1392,9 @@ static const match_table_t tokens = {
 	{Opt_dioread_lock, "dioread_lock"},
 	{Opt_discard, "discard"},
 	{Opt_nodiscard, "nodiscard"},
-	{Opt_init_itable, "init_itable=%u"},
-	{Opt_init_itable, "init_itable"},
-	{Opt_noinit_itable, "noinit_itable"},
+	{Opt_init_inode_table, "init_itable=%u"},
+	{Opt_init_inode_table, "init_itable"},
+	{Opt_noinit_inode_table, "noinit_itable"},
 	{Opt_err, NULL},
 };
 
@@ -1844,7 +1871,7 @@ set_qf_format:
 		case Opt_dioread_lock:
 			clear_opt(sb, DIOREAD_NOLOCK);
 			break;
-		case Opt_init_itable:
+		case Opt_init_inode_table:
 			set_opt(sb, INIT_INODE_TABLE);
 			if (args[0].from) {
 				if (match_int(&args[0], &option))
@@ -1855,7 +1882,7 @@ set_qf_format:
 				return 0;
 			sbi->s_li_wait_mult = option;
 			break;
-		case Opt_noinit_itable:
+		case Opt_noinit_inode_table:
 			clear_opt(sb, INIT_INODE_TABLE);
 			break;
 		default:
@@ -1958,31 +1985,28 @@ static int ext4_fill_flex_info(struct super_block *sb)
 	struct ext4_group_desc *gdp = NULL;
 	ext4_group_t flex_group_count;
 	ext4_group_t flex_group;
-	unsigned int groups_per_flex = 0;
+	int groups_per_flex = 0;
 	size_t size;
 	int i;
 
 	sbi->s_log_groups_per_flex = sbi->s_es->s_log_groups_per_flex;
-	if (sbi->s_log_groups_per_flex < 1 || sbi->s_log_groups_per_flex > 31) {
+	groups_per_flex = 1 << sbi->s_log_groups_per_flex;
+
+	if (groups_per_flex < 2) {
 		sbi->s_log_groups_per_flex = 0;
 		return 1;
 	}
-	groups_per_flex = 1 << sbi->s_log_groups_per_flex;
 
 	/* We allocate both existing and potentially added groups */
 	flex_group_count = ((sbi->s_groups_count + groups_per_flex - 1) +
 			((le16_to_cpu(sbi->s_es->s_reserved_gdt_blocks) + 1) <<
 			      EXT4_DESC_PER_BLOCK_BITS(sb))) / groups_per_flex;
 	size = flex_group_count * sizeof(struct flex_groups);
-	sbi->s_flex_groups = kzalloc(size, GFP_KERNEL);
+	sbi->s_flex_groups = ext4_kvzalloc(size, GFP_KERNEL);
 	if (sbi->s_flex_groups == NULL) {
-		sbi->s_flex_groups = vzalloc(size);
-		if (sbi->s_flex_groups == NULL) {
-			ext4_msg(sb, KERN_ERR,
-				 "not enough memory for %u flex groups",
-				 flex_group_count);
-			goto failed;
-		}
+		ext4_msg(sb, KERN_ERR, "not enough memory for %u flex groups",
+			 flex_group_count);
+		goto failed;
 	}
 
 	for (i = 0; i < sbi->s_groups_count; i++) {
@@ -2381,17 +2405,25 @@ static unsigned long ext4_get_stripe_size(struct ext4_sb_info *sbi)
 	unsigned long stride = le16_to_cpu(sbi->s_es->s_raid_stride);
 	unsigned long stripe_width =
 			le32_to_cpu(sbi->s_es->s_raid_stripe_width);
+	int ret;
 
 	if (sbi->s_stripe && sbi->s_stripe <= sbi->s_blocks_per_group)
-		return sbi->s_stripe;
+		ret = sbi->s_stripe;
+	else if (stripe_width <= sbi->s_blocks_per_group)
+		ret = stripe_width;
+	else if (stride <= sbi->s_blocks_per_group)
+		ret = stride;
+	else
+		ret = 0;
 
-	if (stripe_width <= sbi->s_blocks_per_group)
-		return stripe_width;
+	/*
+	 * If the stripe width is 1, this makes no sense and
+	 * we set it to 0 to turn off stripe handling code.
+	 */
+	if (ret <= 1)
+		ret = 0;
 
-	if (stride <= sbi->s_blocks_per_group)
-		return stride;
-
-	return 0;
+	return ret;
 }
 
 /* sysfs supprt */
@@ -3406,8 +3438,9 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 			(EXT4_MAX_BLOCK_FILE_PHYS / EXT4_BLOCKS_PER_GROUP(sb)));
 	db_count = (sbi->s_groups_count + EXT4_DESC_PER_BLOCK(sb) - 1) /
 		   EXT4_DESC_PER_BLOCK(sb);
-	sbi->s_group_desc = kmalloc(db_count * sizeof(struct buffer_head *),
-				    GFP_KERNEL);
+	sbi->s_group_desc = ext4_kvmalloc(db_count *
+					  sizeof(struct buffer_head *),
+					  GFP_KERNEL);
 	if (sbi->s_group_desc == NULL) {
 		ext4_msg(sb, KERN_ERR, "not enough memory");
 		goto failed_mount;
@@ -3489,7 +3522,7 @@ static int ext4_fill_super(struct super_block *sb, void *data, int silent)
 
 	INIT_LIST_HEAD(&sbi->s_orphan); /* unlinked but open files */
 	mutex_init(&sbi->s_orphan_lock);
-	mutex_init(&sbi->s_resize_lock);
+	sbi->s_resize_flags = 0;
 
 	sb->s_root = NULL;
 
@@ -3739,12 +3772,8 @@ failed_mount_wq:
 	}
 failed_mount3:
 	del_timer(&sbi->s_err_report);
-	if (sbi->s_flex_groups) {
-		if (is_vmalloc_addr(sbi->s_flex_groups))
-			vfree(sbi->s_flex_groups);
-		else
-			kfree(sbi->s_flex_groups);
-	}
+	if (sbi->s_flex_groups)
+		ext4_kvfree(sbi->s_flex_groups);
 	percpu_counter_destroy(&sbi->s_freeblocks_counter);
 	percpu_counter_destroy(&sbi->s_freeinodes_counter);
 	percpu_counter_destroy(&sbi->s_dirs_counter);
@@ -3754,7 +3783,7 @@ failed_mount3:
 failed_mount2:
 	for (i = 0; i < db_count; i++)
 		brelse(sbi->s_group_desc[i]);
-	kfree(sbi->s_group_desc);
+	ext4_kvfree(sbi->s_group_desc);
 failed_mount:
 	if (sbi->s_proc) {
 		remove_proc_entry(sb->s_id, ext4_proc_root);

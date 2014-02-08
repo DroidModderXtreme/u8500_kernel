@@ -25,6 +25,7 @@
 
 #include "ieee80211_i.h"
 #include "rate.h"
+#include "driver-ops.h"
 
 #define IEEE80211_AUTH_TIMEOUT (HZ / 5)
 #define IEEE80211_AUTH_MAX_TRIES 3
@@ -427,6 +428,14 @@ ieee80211_direct_probe(struct ieee80211_work *wk)
 	struct ieee80211_sub_if_data *sdata = wk->sdata;
 	struct ieee80211_local *local = sdata->local;
 
+	if (!wk->probe_auth.synced) {
+		int ret = drv_tx_sync(local, sdata, wk->filter_ta,
+				      IEEE80211_TX_SYNC_AUTH);
+		if (ret)
+			return WORK_ACT_TIMEOUT;
+	}
+	wk->probe_auth.synced = true;
+
 	wk->probe_auth.tries++;
 	if (wk->probe_auth.tries > IEEE80211_AUTH_MAX_TRIES) {
 		printk(KERN_DEBUG "%s: direct probe to %pM timed out\n",
@@ -450,7 +459,8 @@ ieee80211_direct_probe(struct ieee80211_work *wk)
 	 * will not answer to direct packet in unassociated state.
 	 */
 	ieee80211_send_probe_req(sdata, NULL, wk->probe_auth.ssid,
-				 wk->probe_auth.ssid_len, NULL, 0);
+				 wk->probe_auth.ssid_len, NULL, 0,
+				 (u32) -1, true);
 
 	wk->timeout = jiffies + IEEE80211_AUTH_TIMEOUT;
 	run_again(local, wk->timeout);
@@ -464,6 +474,38 @@ ieee80211_authenticate(struct ieee80211_work *wk)
 {
 	struct ieee80211_sub_if_data *sdata = wk->sdata;
 	struct ieee80211_local *local = sdata->local;
+
+	/* HACK!!! cw1200 device requires SSID to be available at AUTH stage.
+	 * cfg80211 beacon cache is designed to handle multi-SSID BSSes, so
+	 * bss struct returned by cfg80211_get_bss() has random SSID if BSS
+	 * just changed SSID before authentication (typical for p2p).
+	 * This is a firmware design fault, however as a workaround cfg80211
+	 * beacon cache is purged to make sure target BSS is searchable
+	 * in rb-tree at the AUTH stage.
+	 */
+	struct cfg80211_bss *bss;
+	while (true) {
+		bss = cfg80211_get_bss(local->hw.wiphy,
+				wk->probe_auth.bss->channel,
+				wk->probe_auth.bss->bssid,
+				NULL, 0, 0, 0);
+		if (WARN_ON(!bss))
+			break;
+		if (bss == wk->probe_auth.bss) {
+			cfg80211_put_bss(bss);
+			break;
+		}
+		cfg80211_unlink_bss(local->hw.wiphy, bss);
+	}
+	/* End of the hack */
+
+	if (!wk->probe_auth.synced) {
+		int ret = drv_tx_sync(local, sdata, wk->filter_ta,
+				      IEEE80211_TX_SYNC_AUTH);
+		if (ret)
+			return WORK_ACT_TIMEOUT;
+	}
+	wk->probe_auth.synced = true;
 
 	wk->probe_auth.tries++;
 	if (wk->probe_auth.tries > IEEE80211_AUTH_MAX_TRIES) {
@@ -497,6 +539,14 @@ ieee80211_associate(struct ieee80211_work *wk)
 {
 	struct ieee80211_sub_if_data *sdata = wk->sdata;
 	struct ieee80211_local *local = sdata->local;
+
+	if (!wk->assoc.synced) {
+		int ret = drv_tx_sync(local, sdata, wk->filter_ta,
+				      IEEE80211_TX_SYNC_ASSOC);
+		if (ret)
+			return WORK_ACT_TIMEOUT;
+	}
+	wk->assoc.synced = true;
 
 	wk->assoc.tries++;
 	if (wk->assoc.tries > IEEE80211_ASSOC_MAX_TRIES) {
@@ -973,14 +1023,16 @@ static void ieee80211_work_work(struct work_struct *work)
 			if (on_oper_chan != on_oper_chan2) {
 				if (on_oper_chan2) {
 					/* going off oper channel, PS too */
-					ieee80211_offchannel_stop_vifs(local);
+					ieee80211_offchannel_stop_vifs(local,
+								       true);
 					ieee80211_hw_config(local, 0);
 				} else {
 					/* going on channel, but leave PS
 					 * off-channel. */
 					ieee80211_hw_config(local, 0);
 					ieee80211_offchannel_return(local,
-								    true);
+								    true,
+								    false);
 				}
 			} else if (tmp_chan_changed)
 				/* Still off-channel, but on some other
@@ -1083,7 +1135,7 @@ static void ieee80211_work_work(struct work_struct *work)
 		 * beaconing if we were already on-oper-channel
 		 * as a future optimization.
 		 */
-		ieee80211_offchannel_return(local, true);
+		ieee80211_offchannel_return(local, true, true);
 
 		/* give connection some time to breathe */
 		run_again(local, jiffies + HZ/2);

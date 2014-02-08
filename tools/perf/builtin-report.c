@@ -162,23 +162,22 @@ static int perf_session__setup_sample_type(struct perf_session *self)
 {
 	if (!(self->sample_type & PERF_SAMPLE_CALLCHAIN)) {
 		if (sort__has_parent) {
-			fprintf(stderr, "selected --sort parent, but no"
-					" callchain data. Did you call"
-					" perf record without -g?\n");
+			ui__warning("Selected --sort parent, but no "
+				    "callchain data. Did you call "
+				    "'perf record' without -g?\n");
 			return -EINVAL;
 		}
 		if (symbol_conf.use_callchain) {
-			fprintf(stderr, "selected -g but no callchain data."
-					" Did you call perf record without"
-					" -g?\n");
+			ui__warning("Selected -g but no callchain data. Did "
+				    "you call 'perf record' without -g?\n");
 			return -1;
 		}
 	} else if (!dont_use_callchains && callchain_param.mode != CHAIN_NONE &&
 		   !symbol_conf.use_callchain) {
 			symbol_conf.use_callchain = true;
 			if (callchain_register_param(&callchain_param) < 0) {
-				fprintf(stderr, "Can't register callchain"
-						" params\n");
+				ui__warning("Can't register callchain "
+					    "params.\n");
 				return -EINVAL;
 			}
 	}
@@ -540,7 +539,14 @@ int cmd_report(int argc, const char **argv, const char *prefix __used)
 	if (parent_pattern != default_parent_pattern) {
 		if (sort_dimension__add("parent") < 0)
 			return -1;
-		sort_parent.elide = 1;
+
+		/*
+		 * Only show the parent fields if we explicitly
+		 * sort that way. If we only use parent machinery
+		 * for filtering, we don't want it.
+		 */
+		if (!strstr(sort_order, "parent"))
+			sort_parent.elide = 1;
 	} else
 		symbol_conf.exclude_other = false;
 
