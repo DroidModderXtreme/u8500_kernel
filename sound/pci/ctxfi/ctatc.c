@@ -18,6 +18,7 @@
 #include "ctatc.h"
 #include "ctpcm.h"
 #include "ctmixer.h"
+#include "cthardware.h"
 #include "ctsrc.h"
 #include "ctamixer.h"
 #include "ctdaio.h"
@@ -971,11 +972,25 @@ static int atc_select_mic_in(struct ct_atc *atc)
 	return 0;
 }
 
-static struct capabilities atc_capabilities(struct ct_atc *atc)
+static int atc_have_digit_io_switch(struct ct_atc *atc)
 {
 	struct hw *hw = atc->hw;
 
-	return hw->capabilities(hw);
+	return hw->have_digit_io_switch(hw);
+}
+
+static int atc_have_dedicated_mic(struct ct_atc *atc)
+{
+	struct hw *hw = atc->hw;
+
+	return hw->have_dedicated_mic(hw);
+}
+
+static int atc_have_output_switch(struct ct_atc *atc)
+{
+	struct hw *hw = atc->hw;
+
+	return hw->have_output_switch(hw);
 }
 
 static int atc_output_switch_get(struct ct_atc *atc)
@@ -990,6 +1005,13 @@ static int atc_output_switch_put(struct ct_atc *atc, int position)
 	struct hw *hw = atc->hw;
 
 	return hw->output_switch_put(hw, position);
+}
+
+static int atc_have_mic_source_switch(struct ct_atc *atc)
+{
+	struct hw *hw = atc->hw;
+
+	return hw->have_mic_source_switch(hw);
 }
 
 static int atc_mic_source_switch_get(struct ct_atc *atc)
@@ -1642,9 +1664,12 @@ static struct ct_atc atc_preset __devinitdata = {
 	.spdif_out_get_status = atc_spdif_out_get_status,
 	.spdif_out_set_status = atc_spdif_out_set_status,
 	.spdif_out_passthru = atc_spdif_out_passthru,
-	.capabilities = atc_capabilities,
+	.have_digit_io_switch = atc_have_digit_io_switch,
+	.have_dedicated_mic = atc_have_dedicated_mic,
+	.have_output_switch = atc_have_output_switch,
 	.output_switch_get = atc_output_switch_get,
 	.output_switch_put = atc_output_switch_put,
+	.have_mic_source_switch = atc_have_mic_source_switch,
 	.mic_source_switch_get = atc_mic_source_switch_get,
 	.mic_source_switch_put = atc_mic_source_switch_put,
 #ifdef CONFIG_PM

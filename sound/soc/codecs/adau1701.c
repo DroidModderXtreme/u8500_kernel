@@ -140,10 +140,9 @@ static unsigned int adau1701_register_size(struct snd_soc_codec *codec,
 static int adau1701_write(struct snd_soc_codec *codec, unsigned int reg,
 		unsigned int value)
 {
-	unsigned int i;
+	unsigned int i, ret;
 	unsigned int size;
 	uint8_t buf[4];
-	int ret;
 
 	size = adau1701_register_size(codec, reg);
 	if (size == 0)

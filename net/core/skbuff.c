@@ -611,21 +611,8 @@ struct sk_buff *skb_morph(struct sk_buff *dst, struct sk_buff *src)
 }
 EXPORT_SYMBOL_GPL(skb_morph);
 
-/*	skb_copy_ubufs	-	copy userspace skb frags buffers to kernel
- *	@skb: the skb to modify
- *	@gfp_mask: allocation priority
- *
- *	This must be called on SKBTX_DEV_ZEROCOPY skb.
- *	It will copy all frags into kernel and drop the reference
- *	to userspace pages.
- *
- *	If this function is called from an interrupt gfp_mask() must be
- *	%GFP_ATOMIC.
- *
- *	Returns 0 on success or a negative error code on failure
- *	to allocate kernel memory to copy to.
- */
-int skb_copy_ubufs(struct sk_buff *skb, gfp_t gfp_mask)
+/* skb frags copy userspace buffers to kernel */
+static int skb_copy_ubufs(struct sk_buff *skb, gfp_t gfp_mask)
 {
 	int i;
 	int num_frags = skb_shinfo(skb)->nr_frags;
@@ -665,8 +652,6 @@ int skb_copy_ubufs(struct sk_buff *skb, gfp_t gfp_mask)
 		skb_shinfo(skb)->frags[i - 1].page = head;
 		head = (struct page *)head->private;
 	}
-
-	skb_shinfo(skb)->tx_flags &= ~SKBTX_DEV_ZEROCOPY;
 	return 0;
 }
 
@@ -813,8 +798,7 @@ struct sk_buff *pskb_copy(struct sk_buff *skb, gfp_t gfp_mask)
 
 		if (skb_shinfo(skb)->tx_flags & SKBTX_DEV_ZEROCOPY) {
 			if (skb_copy_ubufs(skb, gfp_mask)) {
-				kfree_skb(n);
-				n = NULL;
+				kfree(n);
 				goto out;
 			}
 		}
@@ -1381,21 +1365,8 @@ pull_pages:
 }
 EXPORT_SYMBOL(__pskb_pull_tail);
 
-/**
- *	skb_copy_bits - copy bits from skb to kernel buffer
- *	@skb: source skb
- *	@offset: offset in source
- *	@to: destination buffer
- *	@len: number of bytes to copy
- *
- *	Copy the specified number of bytes from the source skb to the
- *	destination buffer.
- *
- *	CAUTION ! :
- *		If its prototype is ever changed,
- *		check arch/{*}/net/{*}.S files,
- *		since it is called from BPF assembly code.
- */
+/* Copy some data bits from skb to kernel buffer. */
+
 int skb_copy_bits(const struct sk_buff *skb, int offset, void *to, int len)
 {
 	int start = skb_headlen(skb);
@@ -1642,6 +1613,7 @@ int skb_splice_bits(struct sk_buff *skb, unsigned int offset,
 	struct splice_pipe_desc spd = {
 		.pages = pages,
 		.partial = partial,
+		.nr_pages_max = MAX_SKB_FRAGS,
 		.flags = flags,
 		.ops = &sock_pipe_buf_ops,
 		.spd_release = sock_spd_release,
@@ -1688,7 +1660,7 @@ done:
 		lock_sock(sk);
 	}
 
-	splice_shrink_spd(pipe, &spd);
+	splice_shrink_spd(&spd);
 	return ret;
 }
 
@@ -3092,6 +3064,8 @@ static void sock_rmem_free(struct sk_buff *skb)
  */
 int sock_queue_err_skb(struct sock *sk, struct sk_buff *skb)
 {
+	int len = skb->len;
+
 	if (atomic_read(&sk->sk_rmem_alloc) + skb->truesize >=
 	    (unsigned)sk->sk_rcvbuf)
 		return -ENOMEM;
@@ -3106,7 +3080,7 @@ int sock_queue_err_skb(struct sock *sk, struct sk_buff *skb)
 
 	skb_queue_tail(&sk->sk_error_queue, skb);
 	if (!sock_flag(sk, SOCK_DEAD))
-		sk->sk_data_ready(sk, skb->len);
+		sk->sk_data_ready(sk, len);
 	return 0;
 }
 EXPORT_SYMBOL(sock_queue_err_skb);

@@ -171,8 +171,7 @@ static int ocfs2_dir_release(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static int ocfs2_sync_file(struct file *file, loff_t start, loff_t end,
-			   int datasync)
+static int ocfs2_sync_file(struct file *file, int datasync)
 {
 	int err = 0;
 	journal_t *journal;
@@ -185,16 +184,6 @@ static int ocfs2_sync_file(struct file *file, loff_t start, loff_t end,
 			      file->f_path.dentry->d_name.name,
 			      (unsigned long long)datasync);
 
-	err = filemap_write_and_wait_range(inode->i_mapping, start, end);
-	if (err)
-		return err;
-
-	/*
-	 * Probably don't need the i_mutex at all in here, just putting it here
-	 * to be consistent with how fsync used to be called, someone more
-	 * familiar with the fs could possibly remove it.
-	 */
-	mutex_lock(&inode->i_mutex);
 	if (datasync && !(inode->i_state & I_DIRTY_DATASYNC)) {
 		/*
 		 * We still have to flush drive's caches to get data to the
@@ -211,7 +200,6 @@ static int ocfs2_sync_file(struct file *file, loff_t start, loff_t end,
 bail:
 	if (err)
 		mlog_errno(err);
-	mutex_unlock(&inode->i_mutex);
 
 	return (err < 0) ? -EIO : 0;
 }
@@ -1154,8 +1142,6 @@ int ocfs2_setattr(struct dentry *dentry, struct iattr *attr)
 		if (status)
 			goto bail_unlock;
 
-		inode_dio_wait(inode);
-
 		if (i_size_read(inode) > attr->ia_size) {
 			if (ocfs2_should_order_data(inode)) {
 				status = ocfs2_begin_ordered_truncate(inode,
@@ -1293,11 +1279,11 @@ bail:
 	return err;
 }
 
-int ocfs2_permission(struct inode *inode, int mask)
+int ocfs2_permission(struct inode *inode, int mask, unsigned int flags)
 {
 	int ret;
 
-	if (mask & MAY_NOT_BLOCK)
+	if (flags & IPERM_FLAG_RCU)
 		return -ECHILD;
 
 	ret = ocfs2_inode_lock(inode, NULL, 0);
@@ -1307,7 +1293,7 @@ int ocfs2_permission(struct inode *inode, int mask)
 		goto out;
 	}
 
-	ret = generic_permission(inode, mask);
+	ret = generic_permission(inode, mask, flags, ocfs2_check_acl);
 
 	ocfs2_inode_unlock(inode, 0);
 out:
@@ -2252,6 +2238,7 @@ static ssize_t ocfs2_file_aio_write(struct kiocb *iocb,
 relock:
 	/* to match setattr's i_mutex -> rw_lock ordering */
 	if (direct_io) {
+		atomic_inc(&inode->i_dio_count);
 		have_alloc_sem = 1;
 		/* communicate with ocfs2_dio_end_io */
 		ocfs2_iocb_set_sem_locked(iocb);
@@ -2303,6 +2290,7 @@ relock:
 	 */
 	if (direct_io && !can_do_direct) {
 		ocfs2_rw_unlock(inode, rw_level);
+		inode_dio_done(inode);
 
 		have_alloc_sem = 0;
 		rw_level = -1;
@@ -2389,8 +2377,10 @@ out:
 		ocfs2_rw_unlock(inode, rw_level);
 
 out_sems:
-	if (have_alloc_sem)
+	if (have_alloc_sem) {
+		inode_dio_done(inode);
 		ocfs2_iocb_clear_sem_locked(iocb);
+	}
 
 	mutex_unlock(&inode->i_mutex);
 
@@ -2541,6 +2531,7 @@ static ssize_t ocfs2_file_aio_read(struct kiocb *iocb,
 	 */
 	if (filp->f_flags & O_DIRECT) {
 		have_alloc_sem = 1;
+		atomic_inc(&inode->i_dio_count);
 		ocfs2_iocb_set_sem_locked(iocb);
 
 		ret = ocfs2_rw_lock(inode, 0);
@@ -2582,9 +2573,10 @@ static ssize_t ocfs2_file_aio_read(struct kiocb *iocb,
 	}
 
 bail:
-	if (have_alloc_sem)
+	if (have_alloc_sem) {
+		inode_dio_done(inode);
 		ocfs2_iocb_clear_sem_locked(iocb);
-
+	}
 	if (rw_level != -1)
 		ocfs2_rw_unlock(inode, rw_level);
 
@@ -2600,14 +2592,12 @@ const struct inode_operations ocfs2_file_iops = {
 	.listxattr	= ocfs2_listxattr,
 	.removexattr	= generic_removexattr,
 	.fiemap		= ocfs2_fiemap,
-	.get_acl	= ocfs2_iop_get_acl,
 };
 
 const struct inode_operations ocfs2_special_file_iops = {
 	.setattr	= ocfs2_setattr,
 	.getattr	= ocfs2_getattr,
 	.permission	= ocfs2_permission,
-	.get_acl	= ocfs2_iop_get_acl,
 };
 
 /*

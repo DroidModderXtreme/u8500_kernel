@@ -37,7 +37,7 @@
 #include <linux/uaccess.h>
 #include <asm/byteorder.h> /* for htons etc. */
 #include <asm/system.h> /* save/restore_flags */
-#include <linux/atomic.h>
+#include <asm/atomic.h>
 
 #include "common.h"
 #include "resources.h"
@@ -271,8 +271,10 @@ static const struct neigh_ops clip_neigh_ops = {
 	.family =		AF_INET,
 	.solicit =		clip_neigh_solicit,
 	.error_report =		clip_neigh_error,
-	.output =		neigh_direct_output,
-	.connected_output =	neigh_direct_output,
+	.output =		dev_queue_xmit,
+	.connected_output =	dev_queue_xmit,
+	.hh_output =		dev_queue_xmit,
+	.queue_xmit =		dev_queue_xmit,
 };
 
 static int clip_constructor(struct neighbour *neigh)

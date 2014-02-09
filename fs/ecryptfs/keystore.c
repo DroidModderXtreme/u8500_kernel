@@ -1635,14 +1635,11 @@ int ecryptfs_keyring_auth_tok_for_sig(struct key **auth_tok_key,
 
 	(*auth_tok_key) = request_key(&key_type_user, sig, NULL);
 	if (!(*auth_tok_key) || IS_ERR(*auth_tok_key)) {
-		(*auth_tok_key) = ecryptfs_get_encrypted_key(sig);
-		if (!(*auth_tok_key) || IS_ERR(*auth_tok_key)) {
-			printk(KERN_ERR "Could not find key with description: [%s]\n",
-			      sig);
-			rc = process_request_key_err(PTR_ERR(*auth_tok_key));
-			(*auth_tok_key) = NULL;
-			goto out;
-		}
+		printk(KERN_ERR "Could not find key with description: [%s]\n",
+		       sig);
+		rc = process_request_key_err(PTR_ERR(*auth_tok_key));
+		(*auth_tok_key) = NULL;
+		goto out;
 	}
 	down_write(&(*auth_tok_key)->sem);
 	rc = ecryptfs_verify_auth_tok_from_key(*auth_tok_key, auth_tok);
@@ -1765,8 +1762,8 @@ int ecryptfs_parse_packet_set(struct ecryptfs_crypt_stat *crypt_stat,
 	size_t found_auth_tok;
 	size_t next_packet_is_auth_tok_packet;
 	struct list_head auth_tok_list;
-	struct ecryptfs_auth_tok *matching_auth_tok;
-	struct ecryptfs_auth_tok *candidate_auth_tok;
+	struct ecryptfs_auth_tok *matching_auth_tok = NULL;
+	struct ecryptfs_auth_tok *candidate_auth_tok = NULL;
 	char *candidate_auth_tok_sig;
 	size_t packet_size;
 	struct ecryptfs_auth_tok *new_auth_tok;
@@ -2258,7 +2255,7 @@ write_tag_3_packet(char *dest, size_t *remaining_bytes,
 		       auth_tok->token.password.session_key_encryption_key,
 		       crypt_stat->key_size);
 		ecryptfs_printk(KERN_DEBUG,
-				"Cached session key encryption key:\n");
+				"Cached session key " "encryption key: \n");
 		if (ecryptfs_verbosity > 0)
 			ecryptfs_dump_hex(session_key_encryption_key, 16);
 	}

@@ -637,7 +637,6 @@ void sctp_addr_wq_timeout_handler(unsigned long arg)
 		    " for cmd %d at entry %p\n", &sctp_addr_waitq, &addrw->a, addrw->state,
 		    addrw);
 
-#if defined(CONFIG_IPV6) || defined (CONFIG_IPV6_MODULE)
 		/* Now we send an ASCONF for each association */
 		/* Note. we currently don't handle link local IPv6 addressees */
 		if (addrw->a.sa.sa_family == AF_INET6) {
@@ -660,7 +659,7 @@ void sctp_addr_wq_timeout_handler(unsigned long arg)
 				break;
 			}
 		}
-#endif
+
 		list_for_each_entry(sp, &sctp_auto_asconf_splist, auto_asconf_list) {
 			struct sock *sk;
 
@@ -1284,6 +1283,9 @@ SCTP_STATIC __init int sctp_init(void)
 	/* Initialize default stream count setup information. */
 	sctp_max_instreams    		= SCTP_DEFAULT_INSTREAMS;
 	sctp_max_outstreams   		= SCTP_DEFAULT_OUTSTREAMS;
+
+	/* Initialize maximum autoclose timeout. */
+	sctp_max_autoclose		= INT_MAX / HZ;
 
 	/* Initialize handle used for association ids. */
 	idr_init(&sctp_assocs_id);

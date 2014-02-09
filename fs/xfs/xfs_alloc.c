@@ -451,7 +451,8 @@ xfs_alloc_read_agfl(
 			XFS_FSS_TO_BB(mp, 1), 0, &bp);
 	if (error)
 		return error;
-	ASSERT(!xfs_buf_geterror(bp));
+	ASSERT(bp);
+	ASSERT(!XFS_BUF_GETERROR(bp));
 	XFS_BUF_SET_VTYPE_REF(bp, B_FS_AGFL, XFS_AGFL_REF);
 	*bpp = bp;
 	return 0;
@@ -569,7 +570,9 @@ xfs_alloc_ag_vextent_exact(
 	xfs_agblock_t	tbno;	/* start block of trimmed extent */
 	xfs_extlen_t	tlen;	/* length of trimmed extent */
 	xfs_agblock_t	tend;	/* end block of trimmed extent */
+	xfs_agblock_t	end;	/* end of allocated extent */
 	int		i;	/* success/failure of operation */
+	xfs_extlen_t	rlen;	/* length of returned extent */
 
 	ASSERT(args->alignment == 1);
 
@@ -622,16 +625,18 @@ xfs_alloc_ag_vextent_exact(
 	 *
 	 * Fix the length according to mod and prod if given.
 	 */
-	args->len = XFS_AGBLOCK_MIN(tend, args->agbno + args->maxlen)
-						- args->agbno;
+	end = XFS_AGBLOCK_MIN(tend, args->agbno + args->maxlen);
+	args->len = end - args->agbno;
 	xfs_alloc_fix_len(args);
 	if (!xfs_alloc_fix_minleft(args))
 		goto not_found;
 
-	ASSERT(args->agbno + args->len <= tend);
+	rlen = args->len;
+	ASSERT(args->agbno + rlen <= tend);
+	end = args->agbno + rlen;
 
 	/*
-	 * We are allocating agbno for args->len
+	 * We are allocating agbno for rlen [agbno .. end]
 	 * Allocate/initialize a cursor for the by-size btree.
 	 */
 	cnt_cur = xfs_allocbt_init_cursor(args->mp, args->tp, args->agbp,
@@ -2115,14 +2120,14 @@ xfs_read_agf(
 	if (!*bpp)
 		return 0;
 
-	ASSERT(!(*bpp)->b_error);
+	ASSERT(!XFS_BUF_GETERROR(*bpp));
 	agf = XFS_BUF_TO_AGF(*bpp);
 
 	/*
 	 * Validate the magic number of the agf block.
 	 */
 	agf_ok =
-		agf->agf_magicnum == cpu_to_be32(XFS_AGF_MAGIC) &&
+		be32_to_cpu(agf->agf_magicnum) == XFS_AGF_MAGIC &&
 		XFS_AGF_GOOD_VERSION(be32_to_cpu(agf->agf_versionnum)) &&
 		be32_to_cpu(agf->agf_freeblks) <= be32_to_cpu(agf->agf_length) &&
 		be32_to_cpu(agf->agf_flfirst) < XFS_AGFL_SIZE(mp) &&
@@ -2167,7 +2172,7 @@ xfs_alloc_read_agf(
 		return error;
 	if (!*bpp)
 		return 0;
-	ASSERT(!(*bpp)->b_error);
+	ASSERT(!XFS_BUF_GETERROR(*bpp));
 
 	agf = XFS_BUF_TO_AGF(*bpp);
 	pag = xfs_perag_get(mp, agno);

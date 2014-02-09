@@ -208,5 +208,6 @@ int perf_top__tui_browser(struct perf_top *top)
 		},
 	};
 
+	ui_helpline__push("Press <- or ESC to exit");
 	return perf_top_browser__run(&browser);
 }

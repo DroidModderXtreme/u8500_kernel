@@ -448,7 +448,7 @@ static struct string_list *read_node(FILE *f)
 	node.string = buffer;
 
 	if (node.string[1] == '#') {
-		size_t n;
+		int n;
 
 		for (n = 0; n < ARRAY_SIZE(symbol_types); n++) {
 			if (node.string[0] == symbol_types[n].n) {

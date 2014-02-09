@@ -312,7 +312,6 @@ void nf_reinject(struct nf_queue_entry *entry, unsigned int verdict)
 		}
 		break;
 	case NF_STOLEN:
-		break;
 	default:
 		kfree_skb(skb);
 	}

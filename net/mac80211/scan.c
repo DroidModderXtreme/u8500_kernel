@@ -251,8 +251,8 @@ static bool ieee80211_prep_hw_scan(struct ieee80211_local *local)
 	local->hw_scan_req->n_channels = n_chans;
 
 	ielen = ieee80211_build_preq_ies(local, (u8 *)local->hw_scan_req->ie,
-					 req->ie, req->ie_len, band,
-					 req->rates[band], 0);
+					 req->ie, req->ie_len, band, (u32) -1,
+					 0);
 	local->hw_scan_req->ie_len = ielen;
 
 	return true;
@@ -314,7 +314,7 @@ static void __ieee80211_scan_completed(struct ieee80211_hw *hw, bool aborted,
 		if (on_oper_chan2 && (on_oper_chan != on_oper_chan2))
 			enable_beacons = true;
 
-		ieee80211_offchannel_return(local, enable_beacons, true);
+		ieee80211_offchannel_return(local, enable_beacons);
 	}
 
 	ieee80211_recalc_idle(local);
@@ -563,7 +563,7 @@ static void ieee80211_scan_state_leave_oper_channel(struct ieee80211_local *loca
 	/* PS will already be in off-channel mode,
 	 * we do that once at the beginning of scanning.
 	 */
-	ieee80211_offchannel_stop_vifs(local, false);
+	ieee80211_offchannel_stop_vifs(local);
 
 	/*
 	 * What if the nullfunc frames didn't arrive?
@@ -594,7 +594,7 @@ static void ieee80211_scan_state_enter_oper_channel(struct ieee80211_local *loca
 	 * in off-channel state..will put that back
 	 * on-channel at the end of scanning.
 	 */
-	ieee80211_offchannel_return(local, true, false);
+	ieee80211_offchannel_return(local, true);
 
 	*next_delay = HZ / 5;
 	local->next_scan_state = SCAN_DECISION;
@@ -652,15 +652,13 @@ static void ieee80211_scan_state_send_probe(struct ieee80211_local *local,
 {
 	int i;
 	struct ieee80211_sub_if_data *sdata = local->scan_sdata;
-	enum ieee80211_band band = local->hw.conf.channel->band;
 
 	for (i = 0; i < local->scan_req->n_ssids; i++)
 		ieee80211_send_probe_req(
 			sdata, NULL,
 			local->scan_req->ssids[i].ssid,
 			local->scan_req->ssids[i].ssid_len,
-			local->scan_req->ie, local->scan_req->ie_len,
-			local->scan_req->rates[band], false);
+			local->scan_req->ie, local->scan_req->ie_len);
 
 	/*
 	 * After sending probe requests, wait for probe responses
@@ -823,8 +821,10 @@ int ieee80211_request_internal_scan(struct ieee80211_sub_if_data *sdata,
  */
 void ieee80211_scan_cancel(struct ieee80211_local *local)
 {
+	bool abortscan;
+
 	/*
-	 * We are canceling software scan, or deferred scan that was not
+	 * We are only canceling software scan, or deferred scan that was not
 	 * yet really started (see __ieee80211_start_scan ).
 	 *
 	 * Regarding hardware scan:
@@ -836,30 +836,23 @@ void ieee80211_scan_cancel(struct ieee80211_local *local)
 	 * - we can not cancel scan_work since driver can schedule it
 	 *   by ieee80211_scan_completed(..., true) to finish scan
 	 *
-	 * Hence we only call the cancel_hw_scan() callback, but the low-level
-	 * driver is still responsible for calling ieee80211_scan_completed()
-	 * after the scan was completed/aborted.
+	 * Hence low lever driver is responsible for canceling HW scan.
 	 */
 
 	mutex_lock(&local->mtx);
-	if (!local->scan_req)
-		goto out;
-
-	if (test_bit(SCAN_HW_SCANNING, &local->scanning)) {
-		if (local->ops->cancel_hw_scan)
-			drv_cancel_hw_scan(local, local->scan_sdata);
-		goto out;
+	abortscan = local->scan_req && !test_bit(SCAN_HW_SCANNING, &local->scanning);
+	if (abortscan) {
+		/*
+		 * The scan is canceled, but stop work from being pending.
+		 *
+		 * If the work is currently running, it must be blocked on
+		 * the mutex, but we'll set scan_sdata = NULL and it'll
+		 * simply exit once it acquires the mutex.
+		 */
+		cancel_delayed_work(&local->scan_work);
+		/* and clean up */
+		__ieee80211_scan_completed(&local->hw, true, false);
 	}
-
-	/*
-	 * If the work is currently running, it must be blocked on
-	 * the mutex, but we'll set scan_sdata = NULL and it'll
-	 * simply exit once it acquires the mutex.
-	 */
-	cancel_delayed_work(&local->scan_work);
-	/* and clean up */
-	__ieee80211_scan_completed(&local->hw, true, false);
-out:
 	mutex_unlock(&local->mtx);
 }
 

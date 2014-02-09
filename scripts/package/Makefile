@@ -118,12 +118,10 @@ perf-tar=perf-$(KERNELVERSION)
 
 quiet_cmd_perf_tar = TAR
       cmd_perf_tar = \
-git --git-dir=$(srctree)/.git archive --prefix=$(perf-tar)/         \
-	HEAD^{tree} $$(cd $(srctree);                               \
-		       echo $$(cat $(srctree)/tools/perf/MANIFEST)) \
-	-o $(perf-tar).tar;                                         \
+git archive --prefix=$(perf-tar)/ HEAD^{tree}                       \
+	$$(cat $(srctree)/tools/perf/MANIFEST) -o $(perf-tar).tar;  \
 mkdir -p $(perf-tar);                                               \
-git --git-dir=$(srctree)/.git rev-parse HEAD > $(perf-tar)/HEAD;    \
+git rev-parse HEAD > $(perf-tar)/HEAD;                              \
 tar rf $(perf-tar).tar $(perf-tar)/HEAD;                            \
 rm -r $(perf-tar);                                                  \
 $(if $(findstring tar-src,$@),,                                     \

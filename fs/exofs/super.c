@@ -40,8 +40,6 @@
 
 #include "exofs.h"
 
-#define EXOFS_DBGMSG2(M...) do {} while (0)
-
 /******************************************************************************
  * MOUNT OPTIONS
  *****************************************************************************/
@@ -210,48 +208,10 @@ static void destroy_inodecache(void)
 }
 
 /******************************************************************************
- * Some osd helpers
+ * SUPERBLOCK FUNCTIONS
  *****************************************************************************/
-void exofs_make_credential(u8 cred_a[OSD_CAP_LEN], const struct osd_obj_id *obj)
-{
-	osd_sec_init_nosec_doall_caps(cred_a, obj, false, true);
-}
-
-static int exofs_read_kern(struct osd_dev *od, u8 *cred, struct osd_obj_id *obj,
-		    u64 offset, void *p, unsigned length)
-{
-	struct osd_request *or = osd_start_request(od, GFP_KERNEL);
-/*	struct osd_sense_info osi = {.key = 0};*/
-	int ret;
-
-	if (unlikely(!or)) {
-		EXOFS_DBGMSG("%s: osd_start_request failed.\n", __func__);
-		return -ENOMEM;
-	}
-	ret = osd_req_read_kern(or, obj, offset, p, length);
-	if (unlikely(ret)) {
-		EXOFS_DBGMSG("%s: osd_req_read_kern failed.\n", __func__);
-		goto out;
-	}
-
-	ret = osd_finalize_request(or, 0, cred, NULL);
-	if (unlikely(ret)) {
-		EXOFS_DBGMSG("Failed to osd_finalize_request() => %d\n", ret);
-		goto out;
-	}
-
-	ret = osd_execute_request(or);
-	if (unlikely(ret))
-		EXOFS_DBGMSG("osd_execute_request() => %d\n", ret);
-	/* osd_req_decode_sense(or, ret); */
-
-out:
-	osd_end_request(or);
-	EXOFS_DBGMSG2("read_kern(0x%llx) offset=0x%llx "
-		      "length=0x%llx dev=%p ret=>%d\n",
-		      _LLU(obj->id), _LLU(offset), _LLU(length), od, ret);
-	return ret;
-}
+static const struct super_operations exofs_sops;
+static const struct export_operations exofs_export_ops;
 
 static const struct osd_attr g_attr_sb_stats = ATTR_DEF(
 	EXOFS_APAGE_SB_DATA,
@@ -263,19 +223,21 @@ static int __sbi_read_stats(struct exofs_sb_info *sbi)
 	struct osd_attr attrs[] = {
 		[0] = g_attr_sb_stats,
 	};
-	struct ore_io_state *ios;
+	struct exofs_io_state *ios;
 	int ret;
 
-	ret = ore_get_io_state(&sbi->layout, &sbi->comps, &ios);
+	ret = exofs_get_io_state(&sbi->layout, &ios);
 	if (unlikely(ret)) {
-		EXOFS_ERR("%s: ore_get_io_state failed.\n", __func__);
+		EXOFS_ERR("%s: exofs_get_io_state failed.\n", __func__);
 		return ret;
 	}
+
+	ios->cred = sbi->s_cred;
 
 	ios->in_attr = attrs;
 	ios->in_attr_len = ARRAY_SIZE(attrs);
 
-	ret = ore_read(ios);
+	ret = exofs_sbi_read(ios);
 	if (unlikely(ret)) {
 		EXOFS_ERR("Error reading super_block stats => %d\n", ret);
 		goto out;
@@ -302,13 +264,13 @@ static int __sbi_read_stats(struct exofs_sb_info *sbi)
 	}
 
 out:
-	ore_put_io_state(ios);
+	exofs_put_io_state(ios);
 	return ret;
 }
 
-static void stats_done(struct ore_io_state *ios, void *p)
+static void stats_done(struct exofs_io_state *ios, void *p)
 {
-	ore_put_io_state(ios);
+	exofs_put_io_state(ios);
 	/* Good thanks nothing to do anymore */
 }
 
@@ -318,12 +280,12 @@ int exofs_sbi_write_stats(struct exofs_sb_info *sbi)
 	struct osd_attr attrs[] = {
 		[0] = g_attr_sb_stats,
 	};
-	struct ore_io_state *ios;
+	struct exofs_io_state *ios;
 	int ret;
 
-	ret = ore_get_io_state(&sbi->layout, &sbi->comps, &ios);
+	ret = exofs_get_io_state(&sbi->layout, &ios);
 	if (unlikely(ret)) {
-		EXOFS_ERR("%s: ore_get_io_state failed.\n", __func__);
+		EXOFS_ERR("%s: exofs_get_io_state failed.\n", __func__);
 		return ret;
 	}
 
@@ -331,26 +293,20 @@ int exofs_sbi_write_stats(struct exofs_sb_info *sbi)
 	sbi->s_ess.s_numfiles = cpu_to_le64(sbi->s_numfiles);
 	attrs[0].val_ptr = &sbi->s_ess;
 
-
+	ios->cred = sbi->s_cred;
 	ios->done = stats_done;
 	ios->private = sbi;
 	ios->out_attr = attrs;
 	ios->out_attr_len = ARRAY_SIZE(attrs);
 
-	ret = ore_write(ios);
+	ret = exofs_sbi_write(ios);
 	if (unlikely(ret)) {
-		EXOFS_ERR("%s: ore_write failed.\n", __func__);
-		ore_put_io_state(ios);
+		EXOFS_ERR("%s: exofs_sbi_write failed.\n", __func__);
+		exofs_put_io_state(ios);
 	}
 
 	return ret;
 }
-
-/******************************************************************************
- * SUPERBLOCK FUNCTIONS
- *****************************************************************************/
-static const struct super_operations exofs_sops;
-static const struct export_operations exofs_export_ops;
 
 /*
  * Write the superblock to the OSD
@@ -359,9 +315,7 @@ int exofs_sync_fs(struct super_block *sb, int wait)
 {
 	struct exofs_sb_info *sbi;
 	struct exofs_fscb *fscb;
-	struct ore_comp one_comp;
-	struct ore_components comps;
-	struct ore_io_state *ios;
+	struct exofs_io_state *ios;
 	int ret = -ENOMEM;
 
 	fscb = kmalloc(sizeof(*fscb), GFP_KERNEL);
@@ -377,10 +331,7 @@ int exofs_sync_fs(struct super_block *sb, int wait)
 	 * version). Otherwise the exofs_fscb is read-only from mkfs time. All
 	 * the writeable info is set in exofs_sbi_write_stats() above.
 	 */
-
-	exofs_init_comps(&comps, &one_comp, sbi, EXOFS_SUPER_ID);
-
-	ret = ore_get_io_state(&sbi->layout, &comps, &ios);
+	ret = exofs_get_io_state(&sbi->layout, &ios);
 	if (unlikely(ret))
 		goto out;
 
@@ -394,12 +345,14 @@ int exofs_sync_fs(struct super_block *sb, int wait)
 	fscb->s_newfs = 0;
 	fscb->s_version = EXOFS_FSCB_VER;
 
+	ios->obj.id = EXOFS_SUPER_ID;
 	ios->offset = 0;
 	ios->kern_buff = fscb;
+	ios->cred = sbi->s_cred;
 
-	ret = ore_write(ios);
+	ret = exofs_sbi_write(ios);
 	if (unlikely(ret))
-		EXOFS_ERR("%s: ore_write failed.\n", __func__);
+		EXOFS_ERR("%s: exofs_sbi_write failed.\n", __func__);
 	else
 		sb->s_dirt = 0;
 
@@ -407,7 +360,7 @@ int exofs_sync_fs(struct super_block *sb, int wait)
 	unlock_super(sb);
 out:
 	EXOFS_DBGMSG("s_nextid=0x%llx ret=%d\n", _LLU(sbi->s_nextid), ret);
-	ore_put_io_state(ios);
+	exofs_put_io_state(ios);
 	kfree(fscb);
 	return ret;
 }
@@ -431,17 +384,15 @@ static void _exofs_print_device(const char *msg, const char *dev_path,
 
 void exofs_free_sbi(struct exofs_sb_info *sbi)
 {
-	while (sbi->comps.numdevs) {
-		int i = --sbi->comps.numdevs;
-		struct osd_dev *od = sbi->comps.ods[i];
+	while (sbi->layout.s_numdevs) {
+		int i = --sbi->layout.s_numdevs;
+		struct osd_dev *od = sbi->layout.s_ods[i];
 
 		if (od) {
-			sbi->comps.ods[i] = NULL;
+			sbi->layout.s_ods[i] = NULL;
 			osduld_put_device(od);
 		}
 	}
-	if (sbi->comps.ods != sbi->_min_one_dev)
-		kfree(sbi->comps.ods);
 	kfree(sbi);
 }
 
@@ -468,8 +419,8 @@ static void exofs_put_super(struct super_block *sb)
 				  msecs_to_jiffies(100));
 	}
 
-	_exofs_print_device("Unmounting", NULL, sbi->comps.ods[0],
-			    sbi->one_comp.obj.partition);
+	_exofs_print_device("Unmounting", NULL, sbi->layout.s_ods[0],
+			    sbi->layout.s_pid);
 
 	bdi_destroy(&sbi->bdi);
 	exofs_free_sbi(sbi);
@@ -550,19 +501,10 @@ static int _read_and_match_data_map(struct exofs_sb_info *sbi, unsigned numdevs,
 		return -EINVAL;
 	}
 
-	EXOFS_DBGMSG("exofs: layout: "
-		"num_comps=%u stripe_unit=0x%x group_width=%u "
-		"group_depth=0x%llx mirrors_p1=%u raid_algorithm=%u\n",
-		numdevs,
-		sbi->layout.stripe_unit,
-		sbi->layout.group_width,
-		_LLU(sbi->layout.group_depth),
-		sbi->layout.mirrors_p1,
-		sbi->data_map.odm_raid_algorithm);
 	return 0;
 }
 
-static unsigned __ra_pages(struct ore_layout *layout)
+static unsigned __ra_pages(struct exofs_layout *layout)
 {
 	const unsigned _MIN_RA = 32; /* min 128K read-ahead */
 	unsigned ra_pages = layout->group_width * layout->stripe_unit /
@@ -605,11 +547,13 @@ static int exofs_devs_2_odi(struct exofs_dt_device_info *dt_dev,
 	return !(odi->systemid_len || odi->osdname_len);
 }
 
-static int exofs_read_lookup_dev_table(struct exofs_sb_info *sbi,
-				       struct osd_dev *fscb_od,
+static int exofs_read_lookup_dev_table(struct exofs_sb_info **psbi,
 				       unsigned table_count)
 {
-	struct ore_comp comp;
+	struct exofs_sb_info *sbi = *psbi;
+	struct osd_dev *fscb_od;
+	struct osd_obj_id obj = {.partition = sbi->layout.s_pid,
+				 .id = EXOFS_DEVTABLE_ID};
 	struct exofs_device_table *dt;
 	unsigned table_bytes = table_count * sizeof(dt->dt_dev_table[0]) +
 					     sizeof(*dt);
@@ -623,14 +567,10 @@ static int exofs_read_lookup_dev_table(struct exofs_sb_info *sbi,
 		return -ENOMEM;
 	}
 
-	sbi->comps.numdevs = 0;
-
-	comp.obj.partition = sbi->one_comp.obj.partition;
-	comp.obj.id = EXOFS_DEVTABLE_ID;
-	exofs_make_credential(comp.cred, &comp.obj);
-
-	ret = exofs_read_kern(fscb_od, comp.cred, &comp.obj, 0, dt,
-			      table_bytes);
+	fscb_od = sbi->layout.s_ods[0];
+	sbi->layout.s_ods[0] = NULL;
+	sbi->layout.s_numdevs = 0;
+	ret = exofs_read_kern(fscb_od, sbi->s_cred, &obj, 0, dt, table_bytes);
 	if (unlikely(ret)) {
 		EXOFS_ERR("ERROR: reading device table\n");
 		goto out;
@@ -648,18 +588,16 @@ static int exofs_read_lookup_dev_table(struct exofs_sb_info *sbi,
 		goto out;
 
 	if (likely(numdevs > 1)) {
-		unsigned size = numdevs * sizeof(sbi->comps.ods[0]);
+		unsigned size = numdevs * sizeof(sbi->layout.s_ods[0]);
 
-		/* Twice bigger table: See exofs_init_comps() and below
-		 * comment
-		 */
-		sbi->comps.ods = kzalloc(size + size - 1, GFP_KERNEL);
-		if (unlikely(!sbi->comps.ods)) {
-			EXOFS_ERR("ERROR: faild allocating Device array[%d]\n",
-				  numdevs);
+		sbi = krealloc(sbi, sizeof(*sbi) + size, GFP_KERNEL);
+		if (unlikely(!sbi)) {
 			ret = -ENOMEM;
 			goto out;
 		}
+		memset(&sbi->layout.s_ods[1], 0,
+		       size - sizeof(sbi->layout.s_ods[0]));
+		*psbi = sbi;
 	}
 
 	for (i = 0; i < numdevs; i++) {
@@ -681,8 +619,8 @@ static int exofs_read_lookup_dev_table(struct exofs_sb_info *sbi,
 		 * line. We always keep them in device-table order.
 		 */
 		if (fscb_od && osduld_device_same(fscb_od, &odi)) {
-			sbi->comps.ods[i] = fscb_od;
-			++sbi->comps.numdevs;
+			sbi->layout.s_ods[i] = fscb_od;
+			++sbi->layout.s_numdevs;
 			fscb_od = NULL;
 			continue;
 		}
@@ -695,13 +633,13 @@ static int exofs_read_lookup_dev_table(struct exofs_sb_info *sbi,
 			goto out;
 		}
 
-		sbi->comps.ods[i] = od;
-		++sbi->comps.numdevs;
+		sbi->layout.s_ods[i] = od;
+		++sbi->layout.s_numdevs;
 
 		/* Read the fscb of the other devices to make sure the FS
 		 * partition is there.
 		 */
-		ret = exofs_read_kern(od, comp.cred, &comp.obj, 0, &fscb,
+		ret = exofs_read_kern(od, sbi->s_cred, &obj, 0, &fscb,
 				      sizeof(fscb));
 		if (unlikely(ret)) {
 			EXOFS_ERR("ERROR: Malformed participating device "
@@ -718,22 +656,13 @@ static int exofs_read_lookup_dev_table(struct exofs_sb_info *sbi,
 
 out:
 	kfree(dt);
-	if (likely(!ret)) {
-		unsigned numdevs = sbi->comps.numdevs;
-
-		if (unlikely(fscb_od)) {
-			EXOFS_ERR("ERROR: Bad device-table container device not present\n");
-			osduld_put_device(fscb_od);
-			return -EINVAL;
-		}
-		/* exofs round-robins the device table view according to inode
-		 * number. We hold a: twice bigger table hence inodes can point
-		 * to any device and have a sequential view of the table
-		 * starting at this device. See exofs_init_comps()
-		 */
-		for (i = 0; i < numdevs - 1; ++i)
-			sbi->comps.ods[i + numdevs] = sbi->comps.ods[i];
+	if (unlikely(!ret && fscb_od)) {
+		EXOFS_ERR(
+		      "ERROR: Bad device-table container device not present\n");
+		osduld_put_device(fscb_od);
+		ret = -EINVAL;
 	}
+
 	return ret;
 }
 
@@ -747,13 +676,17 @@ static int exofs_fill_super(struct super_block *sb, void *data, int silent)
 	struct exofs_sb_info *sbi;	/*extended info                  */
 	struct osd_dev *od;		/* Master device                 */
 	struct exofs_fscb fscb;		/*on-disk superblock info        */
-	struct ore_comp comp;
+	struct osd_obj_id obj;
 	unsigned table_count;
 	int ret;
 
 	sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
 	if (!sbi)
 		return -ENOMEM;
+
+	ret = bdi_setup_and_register(&sbi->bdi, "exofs", BDI_CAP_MAP_COPY);
+	if (ret)
+		goto free_bdi;
 
 	/* use mount options to fill superblock */
 	if (opts->is_osdname) {
@@ -762,8 +695,6 @@ static int exofs_fill_super(struct super_block *sb, void *data, int silent)
 		odi.osdname_len = strlen(opts->dev_name);
 		odi.osdname = (u8 *)opts->dev_name;
 		od = osduld_info_lookup(&odi);
-		kfree(opts->dev_name);
-		opts->dev_name = NULL;
 	} else {
 		od = osduld_path_lookup(opts->dev_name);
 	}
@@ -778,15 +709,10 @@ static int exofs_fill_super(struct super_block *sb, void *data, int silent)
 	sbi->layout.group_width = 1;
 	sbi->layout.group_depth = -1;
 	sbi->layout.group_count = 1;
+	sbi->layout.s_ods[0] = od;
+	sbi->layout.s_numdevs = 1;
+	sbi->layout.s_pid = opts->pid;
 	sbi->s_timeout = opts->timeout;
-
-	sbi->one_comp.obj.partition = opts->pid;
-	sbi->one_comp.obj.id = 0;
-	exofs_make_credential(sbi->one_comp.cred, &sbi->one_comp.obj);
-	sbi->comps.numdevs = 1;
-	sbi->comps.single_comp = EC_SINGLE_COMP;
-	sbi->comps.comps = &sbi->one_comp;
-	sbi->comps.ods = sbi->_min_one_dev;
 
 	/* fill in some other data by hand */
 	memset(sb->s_id, 0, sizeof(sb->s_id));
@@ -798,11 +724,11 @@ static int exofs_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_bdev = NULL;
 	sb->s_dev = 0;
 
-	comp.obj.partition = sbi->one_comp.obj.partition;
-	comp.obj.id = EXOFS_SUPER_ID;
-	exofs_make_credential(comp.cred, &comp.obj);
+	obj.partition = sbi->layout.s_pid;
+	obj.id = EXOFS_SUPER_ID;
+	exofs_make_credential(sbi->s_cred, &obj);
 
-	ret = exofs_read_kern(od, comp.cred, &comp.obj, 0, &fscb, sizeof(fscb));
+	ret = exofs_read_kern(od, sbi->s_cred, &obj, 0, &fscb, sizeof(fscb));
 	if (unlikely(ret))
 		goto free_sbi;
 
@@ -831,11 +757,9 @@ static int exofs_fill_super(struct super_block *sb, void *data, int silent)
 
 	table_count = le64_to_cpu(fscb.s_dev_table_count);
 	if (table_count) {
-		ret = exofs_read_lookup_dev_table(sbi, od, table_count);
+		ret = exofs_read_lookup_dev_table(&sbi, table_count);
 		if (unlikely(ret))
 			goto free_sbi;
-	} else {
-		sbi->comps.ods[0] = od;
 	}
 
 	__sbi_read_stats(sbi);
@@ -869,20 +793,20 @@ static int exofs_fill_super(struct super_block *sb, void *data, int silent)
 		goto free_sbi;
 	}
 
-	ret = bdi_setup_and_register(&sbi->bdi, "exofs", BDI_CAP_MAP_COPY);
-	if (ret) {
-		EXOFS_DBGMSG("Failed to bdi_setup_and_register\n");
-		goto free_sbi;
-	}
-
-	_exofs_print_device("Mounting", opts->dev_name, sbi->comps.ods[0],
-			    sbi->one_comp.obj.partition);
+	_exofs_print_device("Mounting", opts->dev_name, sbi->layout.s_ods[0],
+			    sbi->layout.s_pid);
+	if (opts->is_osdname)
+		kfree(opts->dev_name);
 	return 0;
 
 free_sbi:
+	bdi_destroy(&sbi->bdi);
+free_bdi:
 	EXOFS_ERR("Unable to mount exofs on %s pid=0x%llx err=%d\n",
-		  opts->dev_name, sbi->one_comp.obj.partition, ret);
+		  opts->dev_name, sbi->layout.s_pid, ret);
 	exofs_free_sbi(sbi);
+	if (opts->is_osdname)
+		kfree(opts->dev_name);
 	return ret;
 }
 
@@ -913,7 +837,7 @@ static int exofs_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
 	struct super_block *sb = dentry->d_sb;
 	struct exofs_sb_info *sbi = sb->s_fs_info;
-	struct ore_io_state *ios;
+	struct exofs_io_state *ios;
 	struct osd_attr attrs[] = {
 		ATTR_DEF(OSD_APAGE_PARTITION_QUOTAS,
 			OSD_ATTR_PQ_CAPACITY_QUOTA, sizeof(__be64)),
@@ -922,18 +846,21 @@ static int exofs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	};
 	uint64_t capacity = ULLONG_MAX;
 	uint64_t used = ULLONG_MAX;
+	uint8_t cred_a[OSD_CAP_LEN];
 	int ret;
 
-	ret = ore_get_io_state(&sbi->layout, &sbi->comps, &ios);
+	ret = exofs_get_io_state(&sbi->layout, &ios);
 	if (ret) {
-		EXOFS_DBGMSG("ore_get_io_state failed.\n");
+		EXOFS_DBGMSG("exofs_get_io_state failed.\n");
 		return ret;
 	}
 
+	exofs_make_credential(cred_a, &ios->obj);
+	ios->cred = sbi->s_cred;
 	ios->in_attr = attrs;
 	ios->in_attr_len = ARRAY_SIZE(attrs);
 
-	ret = ore_read(ios);
+	ret = exofs_sbi_read(ios);
 	if (unlikely(ret))
 		goto out;
 
@@ -962,7 +889,7 @@ static int exofs_statfs(struct dentry *dentry, struct kstatfs *buf)
 	buf->f_namelen = EXOFS_NAME_LEN;
 
 out:
-	ore_put_io_state(ios);
+	exofs_put_io_state(ios);
 	return ret;
 }
 

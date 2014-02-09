@@ -143,7 +143,6 @@ int inode_init_always(struct super_block *sb, struct inode *inode)
 	inode->i_op = &empty_iops;
 	inode->i_fop = &empty_fops;
 	inode->i_nlink = 1;
-	inode->i_opflags = 0;
 	inode->i_uid = 0;
 	inode->i_gid = 0;
 	atomic_set(&inode->i_writecount, 0);
@@ -362,11 +361,9 @@ EXPORT_SYMBOL_GPL(inode_sb_list_add);
 
 static inline void inode_sb_list_del(struct inode *inode)
 {
-	if (!list_empty(&inode->i_sb_list)) {
-		spin_lock(&inode_sb_list_lock);
-		list_del_init(&inode->i_sb_list);
-		spin_unlock(&inode_sb_list_lock);
-	}
+	spin_lock(&inode_sb_list_lock);
+	list_del_init(&inode->i_sb_list);
+	spin_unlock(&inode_sb_list_lock);
 }
 
 static unsigned long hash(struct super_block *sb, unsigned long hashval)
@@ -455,9 +452,7 @@ static void evict(struct inode *inode)
 	BUG_ON(!(inode->i_state & I_FREEING));
 	BUG_ON(!list_empty(&inode->i_lru));
 
-	if (!list_empty(&inode->i_wb_list))
-		inode_wb_list_del(inode);
-
+	inode_wb_list_del(inode);
 	inode_sb_list_del(inode);
 
 	if (op->evict_inode) {
@@ -801,29 +796,6 @@ unsigned int get_next_ino(void)
 EXPORT_SYMBOL(get_next_ino);
 
 /**
- *	new_inode_pseudo 	- obtain an inode
- *	@sb: superblock
- *
- *	Allocates a new inode for given superblock.
- *	Inode wont be chained in superblock s_inodes list
- *	This means :
- *	- fs can't be unmount
- *	- quotas, fsnotify, writeback can't work
- */
-struct inode *new_inode_pseudo(struct super_block *sb)
-{
-	struct inode *inode = alloc_inode(sb);
-
-	if (inode) {
-		spin_lock(&inode->i_lock);
-		inode->i_state = 0;
-		spin_unlock(&inode->i_lock);
-		INIT_LIST_HEAD(&inode->i_sb_list);
-	}
-	return inode;
-}
-
-/**
  *	new_inode 	- obtain an inode
  *	@sb: superblock
  *
@@ -841,16 +813,27 @@ struct inode *new_inode(struct super_block *sb)
 
 	spin_lock_prefetch(&inode_sb_list_lock);
 
-	inode = new_inode_pseudo(sb);
-	if (inode)
+	inode = alloc_inode(sb);
+	if (inode) {
+		spin_lock(&inode->i_lock);
+		inode->i_state = 0;
+		spin_unlock(&inode->i_lock);
 		inode_sb_list_add(inode);
+	}
 	return inode;
 }
 EXPORT_SYMBOL(new_inode);
 
-#ifdef CONFIG_DEBUG_LOCK_ALLOC
-void lockdep_annotate_inode_mutex_key(struct inode *inode)
+/**
+ * unlock_new_inode - clear the I_NEW state and wake up any waiters
+ * @inode:	new inode to unlock
+ *
+ * Called when the inode is fully initialised to clear the new state of the
+ * inode and wake up anyone waiting for the inode to finish initialisation.
+ */
+void unlock_new_inode(struct inode *inode)
 {
+#ifdef CONFIG_DEBUG_LOCK_ALLOC
 	if (S_ISDIR(inode->i_mode)) {
 		struct file_system_type *type = inode->i_sb->s_type;
 
@@ -866,20 +849,7 @@ void lockdep_annotate_inode_mutex_key(struct inode *inode)
 					  &type->i_mutex_dir_key);
 		}
 	}
-}
-EXPORT_SYMBOL(lockdep_annotate_inode_mutex_key);
 #endif
-
-/**
- * unlock_new_inode - clear the I_NEW state and wake up any waiters
- * @inode:	new inode to unlock
- *
- * Called when the inode is fully initialised to clear the new state of the
- * inode and wake up anyone waiting for the inode to finish initialisation.
- */
-void unlock_new_inode(struct inode *inode)
-{
-	lockdep_annotate_inode_mutex_key(inode);
 	spin_lock(&inode->i_lock);
 	WARN_ON(!(inode->i_state & I_NEW));
 	inode->i_state &= ~I_NEW;
@@ -1314,7 +1284,7 @@ static void iput_final(struct inode *inode)
 
 	WARN_ON(inode->i_state & I_NEW);
 
-	if (op->drop_inode)
+	if (op && op->drop_inode)
 		drop = op->drop_inode(inode);
 	else
 		drop = generic_drop_inode(inode);
@@ -1337,8 +1307,7 @@ static void iput_final(struct inode *inode)
 	}
 
 	inode->i_state |= I_FREEING;
-	if (!list_empty(&inode->i_lru))
-		inode_lru_list_del(inode);
+	inode_lru_list_del(inode);
 	spin_unlock(&inode->i_lock);
 
 	evict(inode);

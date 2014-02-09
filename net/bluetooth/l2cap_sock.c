@@ -26,8 +26,6 @@
 
 /* Bluetooth L2CAP sockets. */
 
-#include <linux/security.h>
-
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
 #include <net/bluetooth/l2cap.h>
@@ -292,6 +290,7 @@ static int l2cap_sock_getname(struct socket *sock, struct sockaddr *addr, int *l
 
 	BT_DBG("sock %p, sk %p", sock, sk);
 
+	memset(la, 0, sizeof(struct sockaddr_l2));
 	addr->sa_family = AF_BLUETOOTH;
 	*len = sizeof(struct sockaddr_l2);
 
@@ -935,8 +934,6 @@ static void l2cap_sock_init(struct sock *sk, struct sock *parent)
 		chan->force_reliable = pchan->force_reliable;
 		chan->flushable = pchan->flushable;
 		chan->force_active = pchan->force_active;
-
-		security_sk_clone(parent, sk);
 	} else {
 
 		switch (sk->sk_type) {

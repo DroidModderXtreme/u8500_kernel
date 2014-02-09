@@ -23,7 +23,6 @@
 #include <linux/buffer_head.h>
 #include <linux/random.h>
 #include <linux/bitops.h>
-#include <trace/events/ext3.h>
 
 #include <asm/byteorder.h>
 
@@ -119,7 +118,6 @@ void ext3_free_inode (handle_t *handle, struct inode * inode)
 
 	ino = inode->i_ino;
 	ext3_debug ("freeing inode %lu\n", ino);
-	trace_ext3_free_inode(inode);
 
 	is_directory = S_ISDIR(inode->i_mode);
 
@@ -428,7 +426,6 @@ struct inode *ext3_new_inode(handle_t *handle, struct inode * dir,
 		return ERR_PTR(-EPERM);
 
 	sb = dir->i_sb;
-	trace_ext3_request_inode(dir, mode);
 	inode = new_inode(sb);
 	if (!inode)
 		return ERR_PTR(-ENOMEM);
@@ -564,8 +561,12 @@ got:
 	if (IS_DIRSYNC(inode))
 		handle->h_sync = 1;
 	if (insert_inode_locked(inode) < 0) {
-		err = -EINVAL;
-		goto fail_drop;
+		/*
+		 * Likely a bitmap corruption causing inode to be allocated
+		 * twice.
+		 */
+		err = -EIO;
+		goto fail;
 	}
 	spin_lock(&sbi->s_next_gen_lock);
 	inode->i_generation = sbi->s_next_generation++;
@@ -604,7 +605,6 @@ got:
 	}
 
 	ext3_debug("allocating inode %lu\n", inode->i_ino);
-	trace_ext3_allocate_inode(inode, dir, mode);
 	goto really_out;
 fail:
 	ext3_std_error(sb, err);

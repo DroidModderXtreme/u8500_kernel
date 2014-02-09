@@ -68,7 +68,7 @@ snd-soc-wm8804-objs := wm8804.o
 snd-soc-wm8900-objs := wm8900.o
 snd-soc-wm8903-objs := wm8903.o
 snd-soc-wm8904-objs := wm8904.o
-snd-soc-wm8996-objs := wm8996.o
+snd-soc-wm8915-objs := wm8915.o
 snd-soc-wm8940-objs := wm8940.o
 snd-soc-wm8955-objs := wm8955.o
 snd-soc-wm8960-objs := wm8960.o
@@ -170,7 +170,7 @@ obj-$(CONFIG_SND_SOC_WM8804)	+= snd-soc-wm8804.o
 obj-$(CONFIG_SND_SOC_WM8900)	+= snd-soc-wm8900.o
 obj-$(CONFIG_SND_SOC_WM8903)	+= snd-soc-wm8903.o
 obj-$(CONFIG_SND_SOC_WM8904)	+= snd-soc-wm8904.o
-obj-$(CONFIG_SND_SOC_WM8996)	+= snd-soc-wm8996.o
+obj-$(CONFIG_SND_SOC_WM8915)	+= snd-soc-wm8915.o
 obj-$(CONFIG_SND_SOC_WM8940)	+= snd-soc-wm8940.o
 obj-$(CONFIG_SND_SOC_WM8955)	+= snd-soc-wm8955.o
 obj-$(CONFIG_SND_SOC_WM8960)	+= snd-soc-wm8960.o
@@ -198,9 +198,14 @@ obj-$(CONFIG_SND_SOC_LM4857)	+= snd-soc-lm4857.o
 obj-$(CONFIG_SND_SOC_MAX9877)	+= snd-soc-max9877.o
 obj-$(CONFIG_SND_SOC_TPA6130A2)	+= snd-soc-tpa6130a2.o
 obj-$(CONFIG_SND_SOC_WM2000)	+= snd-soc-wm2000.o
+
 ifdef CONFIG_SND_SOC_UX500_DEBUG
 CFLAGS_av8100_audio.o := -DDEBUG
 CFLAGS_ab3550.o := -DDEBUG
 CFLAGS_cg29xx.o := -DDEBUG
 CFLAGS_ab8500_audio.o := -DDEBUG
+endif
+
+ifeq ($(CONNECTIVITY_ENABLE_FEATURE_STE_CONNECTIVITY),true)
+CFLAGS_ab8500_audio.o += -DDIGITAL_FM_ON_IF1_TO_DA78
 endif
